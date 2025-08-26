@@ -7,7 +7,7 @@ import torch
 from TTS_infer_pack.TextPreprocessor_onnx import TextPreprocessorOnnx
 
 
-MODEL_PATH = "onnx/v1_export/v1"
+MODEL_PATH = "onnx/v2_export/v2"
 
 def audio_postprocess(
     audios,
@@ -55,7 +55,7 @@ def audio_preprocess(audio_path):
     return hubert_feature, spectrum, sv_emb
 
 def preprocess_text(text:str):
-    preprocessor = TextPreprocessorOnnx("playground/bert")
+    preprocessor = TextPreprocessorOnnx("playground/chinese-roberta-wwm-ext-large")
     [phones, bert_features, norm_text] = preprocessor.segment_and_extract_feature_for_text(text, 'all_zh', 'v2')
     phones = np.expand_dims(np.array(phones, dtype=np.int64), axis=0)
     return phones, bert_features.T.astype(np.float32)
@@ -109,8 +109,8 @@ y, k, v, y_emb, logits, samples = t2s_stage_decoder.run(None, {
 })
 
 for idx in tqdm(range(1, 1500)):
-    k = np.pad(k, ((0,0), (0,1), (0,0), (0,0)))
-    v = np.pad(v, ((0,0), (0,1), (0,0), (0,0)))
+    k = np.pad(k, ((0,1), (0,0), (0,0)))
+    v = np.pad(v, ((0,1), (0,0), (0,0)))
     y_seq_len = np.array([y.shape[1]]).astype(np.int64)
     # [1, N] [N_layer, N, 1, 512] [N_layer, N, 1, 512] [1, N, 512] [1] [1, N, 512] [1, N]
     [y, k, v, y_emb, logits, samples] = t2s_stage_decoder.run(None, {
