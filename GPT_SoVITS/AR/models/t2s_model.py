@@ -256,10 +256,55 @@ class T2STransformer:
             )
         return x, k_cache, v_cache
 
+from GPT_SoVITS.AR.models.t2s_model_onnx import Text2SemanticDecoder as Text2SemanticDecoderOnnx
+from AR.models.t2s_lightning_module_onnx import Text2SemanticLightningModule as Text2SemanticLightningModuleOnnx
+from module.models_onnx import SynthesizerTrn
+
+class DictToAttrRecursive(dict):
+    def __init__(self, input_dict):
+        super().__init__(input_dict)
+        for key, value in input_dict.items():
+            if isinstance(value, dict):
+                value = DictToAttrRecursive(value)
+            self[key] = value
+            setattr(self, key, value)
+
+    def __getattr__(self, item):
+        try:
+            return self[item]
+        except KeyError:
+            raise AttributeError(f"Attribute {item} not found")
+
+    def __setattr__(self, key, value):
+        if isinstance(value, dict):
+            value = DictToAttrRecursive(value)
+        super(DictToAttrRecursive, self).__setitem__(key, value)
+        super().__setattr__(key, value)
+
+    def __delattr__(self, item):
+        try:
+            del self[item]
+        except KeyError:
+            raise AttributeError(f"Attribute {item} not found")
+        
+class T2SModel():
+    def __init__(self, t2s_path, version = 'v2'):
+        dict_s1 = torch.load(t2s_path, map_location="cpu")
+        self.config = dict_s1["config"]
+        self.t2s_model = Text2SemanticLightningModuleOnnx(self.config, "ojbk", is_train=False)
+        self.t2s_model.load_state_dict(dict_s1["weight"])
+        self.t2s_model.eval()
+        self.t2s_model.model.init_onnx()
+        self.t2s_model.model.to('cpu')
+    def infer(self, x, bert_feature, prompts, top_k=None):
+        return self.t2s_model.model.forward(x, bert_feature, prompts, top_k=top_k)
+
 
 class Text2SemanticDecoder(nn.Module):
     def __init__(self, config, norm_first=False, top_k=3):
         super(Text2SemanticDecoder, self).__init__()
+        self.t2s_onnx = T2SModel('GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt')
+        print("t2s_onnx initialized")
         self.model_dim = config["model"]["hidden_dim"]
         self.embedding_dim = config["model"]["embedding_dim"]
         self.num_head = config["model"]["head"]
@@ -824,6 +869,13 @@ class Text2SemanticDecoder(nn.Module):
         repetition_penalty: float = 1.35,
         **kwargs,
     ):
+        old_dev = x.device
+        print('infer shapes:', x.shape, bert_feature.shape, prompts.shape)
+        x = x.to('cpu')
+        bert_feature = bert_feature.to('cpu').to(dtype=torch.float32)
+        prompts = prompts.to('cpu')
+        [y, idx] = self.t2s_onnx.infer(x, prompts, bert_feature, top_k=top_k)
+        return y.to(old_dev), idx
         x = self.ar_text_embedding(x)
         x = x + self.bert_proj(bert_feature.transpose(1, 2))
         x = self.ar_text_position(x)

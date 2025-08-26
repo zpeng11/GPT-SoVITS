@@ -34,6 +34,7 @@ from tools.audio_sr import AP_BWE
 from tools.i18n.i18n import I18nAuto, scan_language_list
 from TTS_infer_pack.text_segmentation_method import splits
 from TTS_infer_pack.TextPreprocessor import TextPreprocessor
+from TTS_infer_pack.TextPreprocessor_onnx import TextPreprocessorOnnx
 from sv import SV
 
 resample_transform_dict = {}
@@ -436,8 +437,8 @@ class TTS:
 
         self._init_models()
 
-        self.text_preprocessor: TextPreprocessor = TextPreprocessor(
-            self.bert_model, self.bert_tokenizer, self.configs.device
+        self.text_preprocessor: TextPreprocessorOnnx = TextPreprocessorOnnx(
+            'playground/bert'
         )
 
         self.prompt_cache: dict = {
