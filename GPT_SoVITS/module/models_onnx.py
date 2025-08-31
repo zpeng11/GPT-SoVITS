@@ -967,7 +967,7 @@ def set_no_grad(net_g):
 @torch.jit.script_if_tracing
 def compile_codes_length(codes):
     y_lengths1 = torch.LongTensor([codes.size(2)]).to(codes.device)
-    return y_lengths1 * 2.5 * 1.5
+    return y_lengths1
 
 
 @torch.jit.script_if_tracing
@@ -1069,14 +1069,14 @@ class SynthesizerTrnV3(nn.Module):
         return ge
 
     def forward(self, codes, text, ge, speed=1):
-        y_lengths1 = compile_codes_length(codes)
+        y_lengths1 = compile_codes_length(codes) * (3.875 if self.version == "v3" else 4)
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
             quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")  ##BCT
         x, m_p, logs_p, y_mask = self.enc_p(quantized, text, ge, speed)
         fea = self.bridge(x)
-        fea = F.interpolate(fea, scale_factor=1.875, mode="nearest")  ##BCT
+        fea = F.interpolate(fea, scale_factor=(1.875 if self.version == "v3" else 2), mode="nearest")  ##BCT
         ####more wn paramter to learn mel
         fea, y_mask_ = self.wns1(fea, y_lengths1, ge)
         return fea
