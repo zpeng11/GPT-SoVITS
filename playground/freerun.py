@@ -140,6 +140,7 @@ vtis = ort.InferenceSession(MODEL_PATH+"_export_vits.onnx")
     "input_text_phones": input_phones,
     "pred_semantic": pred_semantic,
     "spectrum": spectrum.astype(np.float32),
+    "speed": np.array([1.0]).astype(np.float32),
     # "sv_emb": sv_emb.astype(np.float32)
 })
 
