@@ -321,19 +321,16 @@ class VitsV4Model(nn.Module):
         codes = self.vq_model.extract_latent(ssl_content)
         prompt = codes[0, 0].unsqueeze(0)
         ge = self.vq_model.create_ge(spectrum)
-        print('first vq_model:', prompt.unsqueeze(0).shape, ref_seq.shape, ge.shape)
         fea_ref = self.vq_model(prompt.unsqueeze(0), ref_seq, ge)
-        print('second vq_model:', pred_semantic.shape, text_seq.shape, ge.shape)
         fea_todo = self.vq_model(pred_semantic, text_seq, ge)
-        print("mel2 shape:", mel2.shape, "fea_ref shape:", fea_ref.shape)
         T_min = torch.min(torch.onnx.operators.shape_as_tensor(mel2)[2], 
                           torch.onnx.operators.shape_as_tensor(fea_ref)[2])
+        mel2 = mel2[:, :, :T_min]
         fea_ref = fea_ref[:, :, :T_min]
         T_min = torch.min(torch.tensor([500]), T_min)
         mel2 = mel2[:, :, -T_min:]
         fea_ref = fea_ref[:, :, -T_min:]
         chunk_len = 1000 - T_min
-        print(chunk_len.shape, mel2.shape, fea_ref.shape)
         return fea_ref.transpose(1, 2), fea_todo.transpose(1, 2), chunk_len, mel2
 
 class GptSoVits():
