@@ -205,7 +205,7 @@ class TextEncoder(nn.Module):
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, y, text, ge, speed=1):
-        if type(speed) == float:
+        if type(speed) == float or type(speed) == int:
             speed = torch.FloatTensor([speed])
         y_mask = torch.ones_like(y[:1, :1, :])
 
@@ -958,6 +958,52 @@ class CFM(torch.nn.Module):
             t = t + d
             x[:, :, :prompt_len] = 0.0
         return x
+    
+class CFMOnnx(torch.nn.Module):
+    def __init__(self, in_channels, dit):
+        super().__init__()
+        self.estimator = dit
+        self.in_channels = in_channels
+
+    def forward(
+        self,
+        mu: torch.Tensor,
+        prompt: torch.Tensor,
+        n_timesteps: torch.LongTensor,
+        i_timestep: torch.LongTensor,
+        temperature: torch.LongTensor,
+        x_last: torch.LongTensor,
+        text_cache: torch.Tensor,
+        dt_cache: torch.Tensor
+    ):
+        """Forward diffusion"""
+        x_lens = torch.onnx.operators.shape_as_tensor(mu)[1:2]
+        B, T = mu.size(0), mu.size(1)
+
+        #如果x_last 存在，使用x_last, 否则初始化使用randn，常数级代价
+        x = torch.randn([B, self.in_channels, T], device=mu.device, dtype=mu.dtype) * temperature
+        x = torch.cat([x, x_last], dim=0)[-B:, :, :]
+
+
+        prompt_len = prompt.size(-1)
+        prompt_x = torch.zeros_like(x, dtype=mu.dtype)
+        prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+        x[..., :prompt_len] = 0.0
+        mu = mu.transpose(2, 1)
+        t = torch.tensor(0.0, dtype=x.dtype, device=x.device)
+        d = 1.0 / n_timesteps
+        t = t + d * i_timestep
+        d_tensor = torch.ones(x.size(0), device=x.device, dtype=mu.dtype) * d
+        t_tensor = torch.ones(x.size(0), device=x.device, dtype=mu.dtype) * t
+
+        # text_cache_empty = torch.empty((0, T, 512), dtype=x.dtype).to(x.device)
+        # dt_cache_empty = torch.empty((0, 1024), dtype=x.dtype).to(x.device)
+
+        v_pred, text_embed, dt = self.estimator.infer(x, prompt_x, x_lens, t_tensor, d_tensor, mu, text_cache, dt_cache)
+        v_pred = v_pred.transpose(2, 1)
+        x = x + d * v_pred
+        return x, text_embed, dt
+
 
 
 def set_no_grad(net_g):

@@ -192,3 +192,54 @@ class DiT(nn.Module):
             return output, text_embed, dt
         else:
             return output
+
+    def infer(  # x, prompt_x, x_lens, t, style,cond
+        self,  # d is channel,n is T
+        x0: torch.Tensor,  # nosied input audio  # noqa: F722
+        cond0: torch.Tensor,  # masked cond audio  # noqa: F722
+        x_lens: torch.Tensor,
+        time: torch.Tensor,  # time step  # noqa: F821 F722
+        dt_base_bootstrap: torch.Tensor,
+        text0: torch.Tensor,  # : int["b nt"]  # noqa: F722#####condition feature
+        text_cache: torch.Tensor,  # torch tensor as text_embed
+        dt_cache: torch.Tensor,  # torch tensor as dt
+    ):
+        x = x0.transpose(2, 1)
+        cond = cond0.transpose(2, 1)
+        text = text0.transpose(2, 1)
+        mask = sequence_mask(x_lens, max_length=x.size(1)).to(x.device)
+
+        batch, seq_len = x.shape[0], x.shape[1]
+        if time.ndim == 0:
+            time = time.repeat(batch)
+
+        t = self.time_embed(time)
+        #将dt_base_bootstrap根据是否有dt_cache进行slice，如有cache将会slice出0shape的dt_base_bootstrap并且计算代价可忽略
+        dt_base_bootstrap = dt_base_bootstrap[0:1 - dt_cache.size(0)]
+        #embedded 后的dt_base_bootstrap与dt_cache拼接，其中一定会有一个在0axis上是0所以形状确定
+        dt = torch.cat([self.d_embed(dt_base_bootstrap), dt_cache], axis=0)
+        t += dt
+
+        #将text根据是否有text_cache进行slice，如有cache将会slice出0shape的text并且计算代价可忽略
+        text_sliced = text[0:1 - text_cache.size(0)]
+        #embedded 后的text与text_cache拼接，其中一定会有一个在0axis上是0所以形状确定
+        text_embed = torch.cat([self.text_embed(text_sliced, seq_len, drop_text=False), text_cache], axis=0)
+
+        x = self.input_embed(x, cond, text_embed, drop_audio_cond=False)
+
+        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+
+        if self.long_skip_connection is not None:
+            residual = x
+
+        for block in self.transformer_blocks:
+            x = block(x, t, mask=mask, rope=rope)
+
+        if self.long_skip_connection is not None:
+            x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
+
+        x = self.norm_out(x, t)
+        output = self.proj_out(x)
+
+        return output, text_embed, dt
+

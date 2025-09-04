@@ -16,7 +16,7 @@ from text import cleaned_text_to_sequence
 import onnxsim
 from onnxconverter_common import float16
 from module.mel_processing import mel_spectrogram_torch
-from module.models_onnx import CFM, Generator, SynthesizerTrnV3
+from module.models_onnx import CFMOnnx, Generator, SynthesizerTrnV3
 
 from io import BytesIO
 
@@ -25,6 +25,11 @@ spec_max = 2
 
 def norm_spec(x):
     return (x - spec_min) / (spec_max - spec_min) * 2 - 1
+
+def denorm_spec(x):
+    spec_min = -12
+    spec_max = 2
+    return (x + 1) / 2 * (spec_max - spec_min) + spec_min
 
 mel_fn_v3 = lambda x: mel_spectrogram_torch(
     x,
@@ -141,6 +146,30 @@ class DictToAttrRecursive(dict):
         except KeyError:
             raise AttributeError(f"Attribute {item} not found")
 
+class HifiGANVocoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hifigan = Generator(
+            initial_channel=100,
+            resblock="1",
+            resblock_kernel_sizes=[3, 7, 11],
+            resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+            upsample_rates=[10, 6, 2, 2, 2],
+            upsample_initial_channel=512,
+            upsample_kernel_sizes=[20, 12, 4, 4, 4],
+            gin_channels=0,
+            is_bias=True,
+        )
+        self.hifigan.eval()
+        self.hifigan.remove_weight_norm()
+        state_dict_g = torch.load(
+            "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" , map_location="cpu"
+        )
+        print("loading vocoder", self.hifigan.load_state_dict(state_dict_g))
+
+    def forward(self, x):
+        x = denorm_spec(x)
+        return self.hifigan(x)
 
 class T2SInitStage(nn.Module):
     def __init__(self, t2s, vits:SynthesizerTrn):
@@ -214,11 +243,11 @@ class T2SModel(nn.Module):
             input_names=["ref_text_phones", "input_text_phones", "ref_text_bert", "input_text_bert", "hubert_ssl_content"],
             output_names=["x", "prompt", "init_k", "init_v", 'x_seq_len', 'y_seq_len'],
             dynamic_axes={
-                "ref_text_phones": {1: "ref_length"},
-                "input_text_phones": {1: "text_length"},
-                "ref_text_bert": {0: "ref_length"},
-                "input_text_bert": {0: "text_length"},
-                "hubert_ssl_content": {2: "ssl_length"},
+                "ref_text_phones": {1: "ref_text_phones_length"},
+                "input_text_phones": {1: "input_text_phones_length"},
+                "ref_text_bert": {0: "ref_text_bert_length"},
+                "input_text_bert": {0: "input_text_bert_length"},
+                "hubert_ssl_content": {2: "hubert_ssl_content_length"},
             },
             opset_version=16,
             do_constant_folding=False
@@ -331,7 +360,7 @@ class VitsV4Model(nn.Module):
         mel2 = mel2[:, :, -T_min:]
         fea_ref = fea_ref[:, :, -T_min:]
         chunk_len = 1000 - T_min
-        return fea_ref.transpose(1, 2), fea_todo.transpose(1, 2), chunk_len, mel2
+        return fea_ref, fea_todo, chunk_len, mel2
 
 class GptSoVits():
     def __init__(self, vits, t2s):
@@ -358,11 +387,16 @@ class GptSoVits():
         )
         simplify_onnx_model(f"onnx/{project_name}/{project_name}_vits.onnx")
 
-class GptSoVitsV3V4(nn.Module):
+class GptSoVitsV4(nn.Module):
     def __init__(self, vits, t2s):
         super().__init__()
         self.vits = vits
         self.t2s = t2s
+        in_channels = self.vits.vq_model.cfm.in_channels
+        estimator = self.vits.vq_model.cfm.estimator
+        self.cfm = CFMOnnx(in_channels, estimator)
+        del self.vits.vq_model.cfm
+        self.hifigan = HifiGANVocoder()
 
     def forward(self, ref_seq, text_seq, ref_bert, text_bert, ssl_content, spectrum, mel2, top_k=None, top_p=None, repetition_penalty=None, temperature=None):
         pred_semantic = self.t2s(ref_seq, text_seq, ref_bert, text_bert, ssl_content, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
@@ -389,7 +423,47 @@ class GptSoVitsV3V4(nn.Module):
             opset_version=17,
             verbose=False,
         )
-        simplify_onnx_model(f"onnx/{project_name}/{project_name}_vits.onnx")
+        # simplify_onnx_model(f"onnx/{project_name}/{project_name}_vits.onnx")
+        cmf_res_rand = torch.randn(1, 100, 934).to(torch.float32)
+        torch.onnx.export(
+            self.hifigan,
+            (cmf_res_rand,),
+            f"onnx/{project_name}/{project_name}_hifigan.onnx",
+            input_names=["cfm_res"],
+            output_names=["audio48k"],
+            dynamic_axes={
+                "cfm_res": {2: "cfm_length"},
+                "audio48k": {2: "audio_length"},
+            },
+            opset_version=17,
+            verbose=False,
+        )
+        # simplify_onnx_model(f"onnx/{project_name}/{project_name}_hifigan.onnx")
+        mu_random = torch.randn(1, 930, 512).to(torch.float32)
+        prompt_random = torch.randn(1, 100, 486).to(torch.float32)
+        n_timesteps = torch.LongTensor([32])
+        i_timesteps = torch.LongTensor([16])
+        temperature = torch.FloatTensor([1.0])
+        x_last = torch.randn(1, 100, 930).to(torch.float32)
+        text_cache_empty = torch.empty((0, 930, 512), dtype=mu_random.dtype)
+        dt_cache_empty = torch.empty((0, 1024), dtype=mu_random.dtype)
+        torch.onnx.export(
+            self.cfm,
+            (mu_random, prompt_random, n_timesteps, i_timesteps, temperature, x_last, text_cache_empty, dt_cache_empty),
+            f"onnx/{project_name}/{project_name}_cfm.onnx",
+            input_names=["mu", "prompt", "n_timesteps", "i_timesteps", "temperature", "x_last", "text_cache", "dt_cache"],
+            output_names=["x_last_output", "text_cache_output", "dt_cache_output"],
+            dynamic_axes={
+                "mu": {1: "mu_length"},
+                "prompt": {2: "prompt_length"},
+                "x_last": {0:"x_last_length", 2: "mu_length"},
+                "text_cache": {0: "text_cache_length", 1: "mu_length"},
+                "dt_cache": {0: "dt_cache_length"},
+            },
+            opset_version=17,
+            verbose=False,
+        )
+        # simplify_onnx_model(f"onnx/{project_name}/{project_name}_cfm.onnx")
 
 class AudioPreprocess(nn.Module):
     def __init__(self):
@@ -430,8 +504,8 @@ def export(vits_path, gpt_path, project_name, voice_model_version, export_audio_
     else:
         vits = VitsModel(vits_path, version=voice_model_version)
     gpt = T2SModel(gpt_path, vits)
-    if voice_model_version not in ['v1', 'v2', 'v2pro', 'v2proplus']:
-        gpt_sovits = GptSoVitsV3V4(vits, gpt)
+    if voice_model_version.lower() == 'v4':
+        gpt_sovits = GptSoVitsV4(vits, gpt)
     else:
         gpt_sovits = GptSoVits(vits, gpt)
     preprocessor = AudioPreprocess()
@@ -502,7 +576,7 @@ def export(vits_path, gpt_path, project_name, voice_model_version, export_audio_
     os.makedirs(f"onnx/{project_name}", exist_ok=True)
 
     [ssl_content, spectrum, sv_emb, mel2_v4] = preprocessor(ref_audio32k)
-    if voice_model_version not in ['v1', 'v2', 'v2pro', 'v2proplus']:
+    if voice_model_version.lower() == 'v4':
         gpt_sovits.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content.float(), spectrum.float(), mel2_v4, project_name, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
     else:
         gpt_sovits.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content.float(), spectrum.float(), sv_emb.float(), speed, project_name, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
@@ -517,7 +591,7 @@ def export(vits_path, gpt_path, project_name, voice_model_version, export_audio_
                         "spectrum": {2: "spectrum_length"},
                         "mel2_v4": {2: "mel2_length"}
                     })
-        simplify_onnx_model(f"onnx/{project_name}/{project_name}_audio_preprocess.onnx")
+        # simplify_onnx_model(f"onnx/{project_name}/{project_name}_audio_preprocess.onnx")
         
     if half_precision:
         if export_audio_preprocessor:
@@ -576,6 +650,6 @@ if __name__ == "__main__":
     vits_path = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
     exp_path = "v4_export"
     version = "v4"
-    export(vits_path, gpt_path, exp_path, version, export_audio_preprocessor=False)
+    export(vits_path, gpt_path, exp_path, version)
 
     
