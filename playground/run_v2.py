@@ -7,7 +7,7 @@ import torch
 from TTS_infer_pack.TextPreprocessor_onnx import TextPreprocessorOnnx
 
 
-MODEL_PATH = "onnx/v4_export/v4"
+MODEL_PATH = "onnx/v2_export/v2"
 OUTPUT_PATH = 'playground/output.wav'
 REF_AUDIO_PATH = "playground/ref/audio.wav"
 REF_TEXT = "近日江苏苏州荷花市集开张热闹与浪漫交织"
@@ -23,7 +23,7 @@ def audio_postprocess(
     audios,
     fragment_interval: float = 0.3,
 ):
-    zero_wav = np.zeros((int(48000 * fragment_interval),)).astype(np.float32)
+    zero_wav = np.zeros((int(32000 * fragment_interval),)).astype(np.float32)
     for i, audio in enumerate(audios):
         max_audio = np.abs(audio).max()  # 简单防止16bit爆音
         if max_audio > 1:
@@ -37,7 +37,7 @@ def audio_postprocess(
 
     audio_tensor = torch.from_numpy(audio).unsqueeze(0)
 
-    torchaudio.save(OUTPUT_PATH, audio_tensor, 48000)
+    torchaudio.save(OUTPUT_PATH, audio_tensor, 32000)
 
     return audio
 
@@ -62,7 +62,7 @@ def audio_preprocess(audio_path):
     ort_session = ort.InferenceSession(MODEL_PATH + "_export_audio_preprocess.onnx")
     ort_inputs = {ort_session.get_inputs()[0].name: waveform.numpy()}
     [hubert_feature, spectrum, sv_emb, mel2_v4] = ort_session.run(None, ort_inputs)
-    return hubert_feature, spectrum, sv_emb, mel2_v4
+    return hubert_feature, spectrum
 
 def preprocess_text(text:str):
     preprocessor = TextPreprocessorOnnx(ROBERTA_PATH)
@@ -81,7 +81,7 @@ def preprocess_text(text:str):
 [ref_phones, ref_bert] = preprocess_text(REF_TEXT)
 
 
-[audio_prompt_hubert, spectrum, sv_emb, mel2_v4] = audio_preprocess(REF_AUDIO_PATH)
+[audio_prompt_hubert, spectrum] = audio_preprocess(REF_AUDIO_PATH)
 
 # audio_prompt_hubert_saved = np.load("playground/ref/audio_prompt_hubert.npy").astype(np.float32)
 
@@ -144,71 +144,13 @@ y = y[:,:-1]
 
 pred_semantic = np.expand_dims(y[:, -idx:], axis=0)
 
-vits = ort.InferenceSession(MODEL_PATH+"_export_vits.onnx")
+vtis = ort.InferenceSession(MODEL_PATH+"_export_vits.onnx")
 
-speed = np.array([SPEED], dtype=np.float32)
-fea_ref, fea_todo, chunk_len, mel2_v4 = vits.run(None, {
-    'hubert_ssl_content': audio_prompt_hubert,
-    'spectrum': spectrum,
-    'ref_text_phones': ref_phones,
-    'input_text_phones': input_phones,
-    'pred_semantic': pred_semantic,
-    'mel2': mel2_v4,
-    'speed': speed
+[audio] = vtis.run(None, {
+    "input_text_phones": input_phones,
+    "pred_semantic": pred_semantic,
+    "spectrum": spectrum.astype(np.float32),
+    "speed": np.array([SPEED]).astype(np.float32)
 })
 
-
-def cfm_onnx(fea, mel, sample_steps):
-    # Implement the ONNX export logic for CFM here
-    cfm_onnx = ort.InferenceSession('onnx/v4_export/v4_export_cfm.onnx')
-    mu_length = fea.shape[1]
-    x_last = np.empty((0, 100, mu_length), dtype=np.float32)
-    temperature = np.array([1.0], dtype=np.float32)
-    n_timesteps = np.array([sample_steps], dtype=np.int64)
-    i_timestep = np.array([0], dtype=np.int64)
-    mu = fea
-    prompt = mel
-    text_cache = np.empty((0, mu_length, 512), dtype=np.float32)
-    dt_cache = np.empty((0, 1024), dtype=np.float32)
-    for _ in tqdm(range(sample_steps)):
-        x_last, text_cache, dt_cache = cfm_onnx.run(None, {
-            'x_last': x_last,
-            'mu': mu,
-            'prompt': prompt,
-            'temperature': temperature,
-            'n_timesteps': n_timesteps,
-            'i_timesteps': i_timestep,
-            'text_cache': text_cache,
-            'dt_cache': dt_cache,
-        })
-        i_timestep[0] += 1
-    return x_last
-
-chunk_len = chunk_len[0]
-sample_steps = 32
-T_min = mel2_v4.shape[2]
-cfm_resss = []
-idx = 0
-while 1:
-    fea_todo_chunk = fea_todo[:, :, idx : idx + chunk_len]
-    if fea_todo_chunk.shape[-1] == 0:
-        break
-    idx += chunk_len
-    fea = np.swapaxes(np.concatenate([fea_ref, fea_todo_chunk], axis=2), 1, 2)
-
-    cfm_res = cfm_onnx(fea, mel2_v4, sample_steps)
-
-    cfm_res = cfm_res[:, :, mel2_v4.shape[2] :]
-
-    mel2_v4 = cfm_res[:, :, -T_min:]
-    fea_ref = fea_todo_chunk[:, :, -T_min:]
-
-    cfm_resss.append(cfm_res)
-cfm_res = np.concatenate(cfm_resss, axis=2)
-
-hifigan = ort.InferenceSession(MODEL_PATH+"_export_hifigan.onnx")
-audio = hifigan.run(None, {
-    "cfm_res": cfm_res
-})[0]
-
-audio_postprocess([audio[0,0,:]])
+audio_postprocess([audio])

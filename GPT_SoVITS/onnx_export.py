@@ -252,7 +252,7 @@ class T2SModel(nn.Module):
             opset_version=16,
             do_constant_folding=False
         )
-        simplify_onnx_model(f"onnx/{project_name}/{project_name}_t2s_init_stage.onnx")
+        # simplify_onnx_model(f"onnx/{project_name}/{project_name}_t2s_init_stage.onnx")
         x, prompt, init_k, init_v, x_seq_len, y_seq_len = self.init_stage(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
         empty_tensor = torch.empty((1,0,512)).to(torch.float)
         x_seq_len = torch.Tensor([x_seq_len]).to(torch.int64)
@@ -283,10 +283,10 @@ class T2SModel(nn.Module):
             verbose=False,
             opset_version=16,
         )
-        simplify_onnx_model(f"onnx/{project_name}/{project_name}_t2s_stage_decoder.onnx")
+        # simplify_onnx_model(f"onnx/{project_name}/{project_name}_t2s_stage_decoder.onnx")
 
 
-class VitsModel(nn.Module):
+class VitsV1V2Model(nn.Module):
     def __init__(self, vits_path, version:str = 'v2'):
         super().__init__()
         dict_s2 = torch.load(vits_path, map_location="cpu", weights_only=False)
@@ -346,12 +346,12 @@ class VitsV4Model(nn.Module):
         self.vq_model.load_state_dict(dict_s2["weight"], strict=False)
         # print(f"filter_length:{self.hps.data.filter_length} sampling_rate:{self.hps.data.sampling_rate} hop_length:{self.hps.data.hop_length} win_length:{self.hps.data.win_length}")
         #v2 filter_length: 2048 sampling_rate: 32000 hop_length: 640 win_length: 2048
-    def forward(self, ssl_content:torch.Tensor, spectrum:torch.Tensor, ref_seq:torch.Tensor, text_seq:torch.Tensor, pred_semantic:torch.Tensor, mel2:torch.Tensor):
+    def forward(self, ssl_content:torch.Tensor, spectrum:torch.Tensor, ref_seq:torch.Tensor, text_seq:torch.Tensor, pred_semantic:torch.Tensor, mel2:torch.Tensor, speed:torch.Tensor):
         codes = self.vq_model.extract_latent(ssl_content)
         prompt = codes[0, 0].unsqueeze(0)
         ge = self.vq_model.create_ge(spectrum)
-        fea_ref = self.vq_model(prompt.unsqueeze(0), ref_seq, ge)
-        fea_todo = self.vq_model(pred_semantic, text_seq, ge)
+        fea_ref = self.vq_model(prompt.unsqueeze(0), ref_seq, ge, speed)
+        fea_todo = self.vq_model(pred_semantic, text_seq, ge, speed)
         T_min = torch.min(torch.onnx.operators.shape_as_tensor(mel2)[2], 
                           torch.onnx.operators.shape_as_tensor(fea_ref)[2])
         mel2 = mel2[:, :, :T_min]
@@ -362,7 +362,7 @@ class VitsV4Model(nn.Module):
         chunk_len = 1000 - T_min
         return fea_ref, fea_todo, chunk_len, mel2
 
-class GptSoVits():
+class GptSoVitsV1V2():
     def __init__(self, vits, t2s):
         super().__init__()
         self.vits = vits
@@ -385,7 +385,7 @@ class GptSoVits():
             opset_version=17,
             verbose=False,
         )
-        simplify_onnx_model(f"onnx/{project_name}/{project_name}_vits.onnx")
+        # simplify_onnx_model(f"onnx/{project_name}/{project_name}_vits.onnx")
 
 class GptSoVitsV4(nn.Module):
     def __init__(self, vits, t2s):
@@ -398,19 +398,19 @@ class GptSoVitsV4(nn.Module):
         del self.vits.vq_model.cfm
         self.hifigan = HifiGANVocoder()
 
-    def forward(self, ref_seq, text_seq, ref_bert, text_bert, ssl_content, spectrum, mel2, top_k=None, top_p=None, repetition_penalty=None, temperature=None):
+    def forward(self, ref_seq, text_seq, ref_bert, text_bert, ssl_content, spectrum, mel2, speed, top_k=None, top_p=None, repetition_penalty=None, temperature=None):
         pred_semantic = self.t2s(ref_seq, text_seq, ref_bert, text_bert, ssl_content, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
-        audio = self.vits(ssl_content, spectrum, ref_seq, text_seq, pred_semantic, mel2)
+        audio = self.vits(ssl_content, spectrum, ref_seq, text_seq, pred_semantic, mel2, speed)
         return audio
 
-    def export(self, ref_seq, text_seq, ref_bert, text_bert, ssl_content, spectrum, mel2, project_name, top_k=None, top_p=None, repetition_penalty=None, temperature=None):
+    def export(self, ref_seq, text_seq, ref_bert, text_bert, ssl_content, spectrum, mel2, speed, project_name, top_k=None, top_p=None, repetition_penalty=None, temperature=None):
         self.t2s.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content, project_name, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
         pred_semantic = self.t2s(ref_seq, text_seq, ref_bert, text_bert, ssl_content, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
         torch.onnx.export(
             self.vits,
-            (ssl_content, spectrum, ref_seq, text_seq, pred_semantic, mel2),
+            (ssl_content, spectrum, ref_seq, text_seq, pred_semantic, mel2, speed),
             f"onnx/{project_name}/{project_name}_vits.onnx",
-            input_names=["hubert_ssl_content", "spectrum", "ref_text_phones", "input_text_phones", "pred_semantic",  "mel2"],
+            input_names=["hubert_ssl_content", "spectrum", "ref_text_phones", "input_text_phones", "pred_semantic",  "mel2", "speed"],
             output_names=["fea_ref", "fea_todo", "chunk_len", "mel2_sliced"],
             dynamic_axes={
                 "hubert_ssl_content": {2: "ssl_length"},
@@ -502,12 +502,12 @@ def export(vits_path, gpt_path, project_name, voice_model_version, export_audio_
     if voice_model_version.lower() == 'v4':
         vits = VitsV4Model(vits_path)
     else:
-        vits = VitsModel(vits_path, version=voice_model_version)
+        vits = VitsV1V2Model(vits_path, version=voice_model_version)
     gpt = T2SModel(gpt_path, vits)
     if voice_model_version.lower() == 'v4':
         gpt_sovits = GptSoVitsV4(vits, gpt)
     else:
-        gpt_sovits = GptSoVits(vits, gpt)
+        gpt_sovits = GptSoVitsV1V2(vits, gpt)
     preprocessor = AudioPreprocess()
     ref_seq = torch.LongTensor(
         [
@@ -577,7 +577,7 @@ def export(vits_path, gpt_path, project_name, voice_model_version, export_audio_
 
     [ssl_content, spectrum, sv_emb, mel2_v4] = preprocessor(ref_audio32k)
     if voice_model_version.lower() == 'v4':
-        gpt_sovits.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content.float(), spectrum.float(), mel2_v4, project_name, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
+        gpt_sovits.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content.float(), spectrum.float(), mel2_v4, speed, project_name, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
     else:
         gpt_sovits.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content.float(), spectrum.float(), sv_emb.float(), speed, project_name, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)
 
@@ -640,7 +640,7 @@ if __name__ == "__main__":
     # version = "v2Pro"
     # export(vits_path, gpt_path, exp_path, version)
 
-    # gpt_path = "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
+    # gpt_path = "GPT_SoVITS/pretrained_models/s1v3.ckpt"
     # vits_path = "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
     # exp_path = "v2proplus_export"
     # version = "v2ProPlus"

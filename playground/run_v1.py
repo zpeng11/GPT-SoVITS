@@ -7,7 +7,17 @@ import torch
 from TTS_infer_pack.TextPreprocessor_onnx import TextPreprocessorOnnx
 
 
-MODEL_PATH = "onnx/v2_export/v2"
+MODEL_PATH = "onnx/v1_export/v1"
+OUTPUT_PATH = 'playground/output.wav'
+REF_AUDIO_PATH = "playground/ref/audio.wav"
+REF_TEXT = "近日江苏苏州荷花市集开张热闹与浪漫交织"
+INPUT_TEXT = "天上的风筝在天上飞，地上的人儿在地上追。"
+ROBERTA_PATH = "playground/chinese-roberta-wwm-ext-large"
+TEMPERATURE = 1.0
+TOP_K = 15
+TOP_P = 1.0
+REPETITION_PENALTY = 1.35
+SPEED = 1.0
 
 def audio_postprocess(
     audios,
@@ -27,7 +37,7 @@ def audio_postprocess(
 
     audio_tensor = torch.from_numpy(audio).unsqueeze(0)
 
-    torchaudio.save('playground/output.wav', audio_tensor, 32000)
+    torchaudio.save(OUTPUT_PATH, audio_tensor, 32000)
 
     return audio
 
@@ -51,34 +61,34 @@ def audio_preprocess(audio_path):
     waveform = load_audio(audio_path)
     ort_session = ort.InferenceSession(MODEL_PATH + "_export_audio_preprocess.onnx")
     ort_inputs = {ort_session.get_inputs()[0].name: waveform.numpy()}
-    [hubert_feature, spectrum, sv_emb] = ort_session.run(None, ort_inputs)
-    return hubert_feature, spectrum, sv_emb
+    [hubert_feature, spectrum, sv_emb, mel2_v4] = ort_session.run(None, ort_inputs)
+    return hubert_feature, spectrum
 
 def preprocess_text(text:str):
-    preprocessor = TextPreprocessorOnnx("playground/chinese-roberta-wwm-ext-large")
-    [phones, bert_features, norm_text] = preprocessor.segment_and_extract_feature_for_text(text, 'all_zh', 'v2')
+    preprocessor = TextPreprocessorOnnx(ROBERTA_PATH)
+    [phones, bert_features, norm_text] = preprocessor.segment_and_extract_feature_for_text(text, 'all_zh', 'v1')
     phones = np.expand_dims(np.array(phones, dtype=np.int64), axis=0)
     return phones, bert_features.T.astype(np.float32)
 
 
 # input_phones_saved = np.load("playground/ref/input_phones.npy")
 # input_bert_saved = np.load("playground/ref/input_bert.npy").T.astype(np.float32)
-[input_phones, input_bert] = preprocess_text("天上的风筝在天上飞，地上的人儿在地上追。")
+[input_phones, input_bert] = preprocess_text(INPUT_TEXT)
 
 
 # ref_phones = np.load("playground/ref/ref_phones.npy")
 # ref_bert = np.load("playground/ref/ref_bert.npy").T.astype(np.float32)
-[ref_phones, ref_bert] = preprocess_text("近日江苏苏州荷花市集开张热闹与浪漫交织")
+[ref_phones, ref_bert] = preprocess_text(REF_TEXT)
 
 
-[audio_prompt_hubert, spectrum, sv_emb] = audio_preprocess("playground/ref/audio.wav")
+[audio_prompt_hubert, spectrum] = audio_preprocess(REF_AUDIO_PATH)
 
 # audio_prompt_hubert_saved = np.load("playground/ref/audio_prompt_hubert.npy").astype(np.float32)
 
-top_k = np.array([15], dtype=np.int64)
-top_p = np.array([1.0], dtype=np.float32)
-repetition_penalty = np.array([1.0], dtype=np.float32)
-temperature = np.array([1.0], dtype=np.float32)
+top_k = np.array([TOP_K], dtype=np.int64)
+top_p = np.array([TOP_P], dtype=np.float32)
+repetition_penalty = np.array([REPETITION_PENALTY], dtype=np.float32)
+temperature = np.array([TEMPERATURE], dtype=np.float32)
 
 t2s_init_stage = ort.InferenceSession(MODEL_PATH+"_export_t2s_init_stage.onnx")
 # t2s_init_step = ort.InferenceSession(MODEL_PATH+"_export_t2s_init_step.onnx")
@@ -140,8 +150,7 @@ vtis = ort.InferenceSession(MODEL_PATH+"_export_vits.onnx")
     "input_text_phones": input_phones,
     "pred_semantic": pred_semantic,
     "spectrum": spectrum.astype(np.float32),
-    "speed": np.array([1.0]).astype(np.float32),
-    # "sv_emb": sv_emb.astype(np.float32)
+    "speed": np.array([SPEED]).astype(np.float32),
 })
 
 audio_postprocess([audio])
