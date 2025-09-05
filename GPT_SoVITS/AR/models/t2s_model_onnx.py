@@ -66,7 +66,7 @@ def logits_to_probs(
     # if top_k is not None: # To be captured by onnx
     v, _ = torch.topk(logits, top_k)
     pivot = v.select(-1, -1).unsqueeze(-1)
-    logits = torch.where(logits < pivot, inf_tensor_value, logits)
+    logits = torch.where(logits < pivot, inf_tensor_value.to(logits.device), logits)
 
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
@@ -131,11 +131,11 @@ class T2SStageDecoder(nn.Module):
         if top_k is None:
             top_k = torch.LongTensor([15]).to(device=y.device)
         if top_p is None:
-            top_p = torch.FloatTensor([1.0]).to(device=y.device)
+            top_p = torch.FloatTensor([1.0]).to(device=y.device).to(y.dtype)
         if repetition_penalty is None:
-            repetition_penalty = torch.FloatTensor([1.0]).to(device=y.device)
+            repetition_penalty = torch.FloatTensor([1.0]).to(device=y.device).to(y.dtype)
         if temperature is None:
-            temperature = torch.FloatTensor([1.0]).to(device=y.device)
+            temperature = torch.FloatTensor([1.0]).to(device=y.device).to(y.dtype)
         minus_one = torch.tensor([-1]).to(y.device).to(torch.int64)
 
         cache = {
@@ -273,10 +273,10 @@ class Text2SemanticDecoder(nn.Module):
         x_seq_len = x.shape[1]
         y_seq_len = prompts.shape[1]
 
-        init_k = torch.zeros(((x_seq_len + y_seq_len), self.num_layers, 512), dtype=torch.float)
-        init_v = torch.zeros(((x_seq_len + y_seq_len), self.num_layers, 512), dtype=torch.float)
+        init_k = torch.zeros(((x_seq_len + y_seq_len), self.num_layers, 512), dtype=x.dtype)
+        init_v = torch.zeros(((x_seq_len + y_seq_len), self.num_layers, 512), dtype=x.dtype)
 
-        empty_tensor = torch.empty((1,0,512)).to(torch.float)
+        empty_tensor = torch.empty((1,0,512)).to(x.dtype)
 
         y, k, v, y_emb, logits, samples = self.stage_decoder(x, prompts, init_k, init_v,
                                                 empty_tensor, top_k=top_k, 
@@ -353,7 +353,7 @@ class Text2SemanticDecoder(nn.Module):
                 xy_attn_mask = torch.zeros((1, x_len + y_len), dtype=torch.bool)
             xy_dec = self.h(xy_pos, mask=xy_attn_mask, cache=cache)
             logits = self.ar_predict_layer(xy_dec[:, -1])
-            samples = sample(logits[0], y, top_k=top_k, top_p=1.0, repetition_penalty=1.35, temperature=torch.Tensor([1.0]))[0].unsqueeze(0)
+            samples = sample(logits[0], y, top_k=top_k, top_p=1.0, repetition_penalty=1.35, temperature=torch.Tensor([1.0]).to(y.device).to(y.dtype))[0].unsqueeze(0)
             if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
                 stop = True
             if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:

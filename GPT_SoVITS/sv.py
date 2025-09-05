@@ -35,10 +35,11 @@ class SV:
         # Disable gradients for all parameters
         for param in self.embedding_model.parameters():
             param.requires_grad = False
+
+        self.embedding_model.half()
         
         with torch.no_grad():
-            if self.is_half == True:
-                wav = wav.half()
+            wav = wav.half()
             feat = Kaldi.fbank_onnx(wav.detach()).unsqueeze(0)
             sv_emb = self.embedding_model.forward3(feat)
         return sv_emb

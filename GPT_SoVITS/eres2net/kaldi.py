@@ -1078,6 +1078,9 @@ def fbank_onnx(
 
     # Apply STFT to all frames simultaneously
     # The batch dimension allows us to process all m frames in parallel
+    original_dtype = batched_frames.dtype
+    if original_dtype == torch.float16:
+        batched_frames = batched_frames.float()
     stft_result = torch.stft(
         batched_frames.flatten(0, 1),  # Shape: (m, 512) - flatten batch and channel dims
         n_fft=512,
@@ -1086,6 +1089,8 @@ def fbank_onnx(
         center=False,  # Don't add padding
         return_complex=False
     )
+    if original_dtype == torch.float16:
+        stft_result = stft_result.half()
 
     # stft_result shape: (m, 257, 1, 2) where last dim is [real, imag]
     # Calculate magnitude: sqrt(real^2 + imag^2)

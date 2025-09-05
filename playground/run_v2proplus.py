@@ -29,6 +29,7 @@ def audio_postprocess(
         max_audio = np.abs(audio).max()  # 简单防止16bit爆音
         if max_audio > 1:
             audio /= max_audio
+        audio = audio.astype(np.float32)
         audio = np.concatenate([audio, zero_wav], axis=0)
         audios[i] = audio
 
@@ -61,7 +62,7 @@ def audio_preprocess(audio_path):
     """Get HuBERT features for the audio file"""
     waveform = load_audio(audio_path)
     ort_session = ort.InferenceSession(MODEL_PATH + "_export_audio_preprocess.onnx")
-    ort_inputs = {ort_session.get_inputs()[0].name: waveform.numpy()}
+    ort_inputs = {ort_session.get_inputs()[0].name: waveform.numpy().astype(np.float16)}
     [hubert_feature, spectrum, sv_emb, mel2_v4] = ort_session.run(None, ort_inputs)
     return hubert_feature, spectrum, sv_emb
 
@@ -69,7 +70,7 @@ def preprocess_text(text:str):
     preprocessor = TextPreprocessorOnnx(ROBERTA_PATH)
     [phones, bert_features, norm_text] = preprocessor.segment_and_extract_feature_for_text(text, 'all_zh', 'v2')
     phones = np.expand_dims(np.array(phones, dtype=np.int64), axis=0)
-    return phones, bert_features.T.astype(np.float32)
+    return phones, bert_features.T.astype(np.float16)
 
 
 # input_phones_saved = np.load("playground/ref/input_phones.npy")
@@ -87,9 +88,9 @@ def preprocess_text(text:str):
 # audio_prompt_hubert_saved = np.load("playground/ref/audio_prompt_hubert.npy").astype(np.float32)
 
 top_k = np.array([TOP_K], dtype=np.int64)
-top_p = np.array([TOP_P], dtype=np.float32)
-repetition_penalty = np.array([REPETITION_PENALTY], dtype=np.float32)
-temperature = np.array([TEMPERATURE], dtype=np.float32)
+top_p = np.array([TOP_P], dtype=np.float16)
+repetition_penalty = np.array([REPETITION_PENALTY], dtype=np.float16)
+temperature = np.array([TEMPERATURE], dtype=np.float16)
 
 t2s_init_stage = ort.InferenceSession(MODEL_PATH+"_export_t2s_init_stage.onnx")
 # t2s_init_step = ort.InferenceSession(MODEL_PATH+"_export_t2s_init_step.onnx")
@@ -101,7 +102,7 @@ t2s_init_stage = ort.InferenceSession(MODEL_PATH+"_export_t2s_init_stage.onnx")
     "ref_text_bert": ref_bert,
     "hubert_ssl_content": audio_prompt_hubert,
 })
-empty_tensor = np.empty((1,0,512)).astype(np.float32)
+empty_tensor = np.empty((1,0,512)).astype(np.float16)
 
 t2s_stage_decoder = ort.InferenceSession(MODEL_PATH+"_export_t2s_stage_decoder.onnx")
 y, k, v, y_emb, logits, samples = t2s_stage_decoder.run(None, {
@@ -150,9 +151,9 @@ vtis = ort.InferenceSession(MODEL_PATH+"_export_vits.onnx")
 [audio] = vtis.run(None, {
     "input_text_phones": input_phones,
     "pred_semantic": pred_semantic,
-    "spectrum": spectrum.astype(np.float32),
-    "speed": np.array([SPEED]).astype(np.float32),
-    "sv_emb": sv_emb.astype(np.float32)
+    "spectrum": spectrum.astype(np.float16),
+    "speed": np.array([SPEED]).astype(np.float16),
+    "sv_emb": sv_emb.astype(np.float16)
 })
 
 audio_postprocess([audio])

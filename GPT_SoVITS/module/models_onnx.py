@@ -971,8 +971,8 @@ class CFMOnnx(torch.nn.Module):
         prompt: torch.Tensor,
         n_timesteps: torch.LongTensor,
         i_timestep: torch.LongTensor,
-        temperature: torch.LongTensor,
-        x_last: torch.LongTensor,
+        temperature: torch.Tensor,
+        x_last: torch.Tensor,
         text_cache: torch.Tensor,
         dt_cache: torch.Tensor
     ):
@@ -981,7 +981,7 @@ class CFMOnnx(torch.nn.Module):
         B, T = mu.size(0), mu.size(1)
 
         #如果x_last 存在，使用x_last, 否则初始化使用randn，常数级代价
-        x = torch.randn([B, self.in_channels, T], device=mu.device, dtype=mu.dtype) * temperature
+        x = torch.randn([B, self.in_channels, T], device=mu.device).to(mu.dtype) * temperature
         x = torch.cat([x, x_last], dim=0)[-B:, :, :]
 
 
@@ -990,9 +990,9 @@ class CFMOnnx(torch.nn.Module):
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0.0
         mu = mu.transpose(2, 1)
-        t = torch.tensor(0.0, dtype=x.dtype, device=x.device)
-        d = 1.0 / n_timesteps
-        t = t + d * i_timestep
+        t = torch.tensor(0.0, dtype=mu.dtype, device=mu.device)
+        d = (1.0 / n_timesteps).to(mu.dtype)
+        t = (t + d * i_timestep).to(mu.dtype)
         d_tensor = torch.ones(x.size(0), device=x.device, dtype=mu.dtype) * d
         t_tensor = torch.ones(x.size(0), device=x.device, dtype=mu.dtype) * t
 
