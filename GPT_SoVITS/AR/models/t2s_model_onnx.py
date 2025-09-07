@@ -142,7 +142,6 @@ class T2SStageDecoder(nn.Module):
             "all_stage": self.num_layers,
             "k": k,
             "v": v,
-            "y_emb": y_emb,
             "first_infer": first_infer,
             "stage": 0,
             "x_seq_len": x_seq_len,
@@ -153,16 +152,12 @@ class T2SStageDecoder(nn.Module):
         multipled = minus_one * first_infer * y_seq_len
         index_offset = torch.min(minus_one, multipled)
         y_to_emb = y[:, index_offset:]
-        # 对y输入进行embedding
-        y_emb = torch.cat(
-            [
-                cache["y_emb"],
-                self.ar_audio_embedding(y_to_emb),
-            ],
-            1,
-        )
-        cache["y_emb"] = y_emb
-        y_pos = self.ar_audio_position(y_emb)
+        # 对y输入进行embedding, 获取y_emb的增量
+        y_emb_increasement = self.ar_audio_embedding(y_to_emb)
+        start_index = y_seq_len + index_offset
+        end_index = y_seq_len
+        y_emb[:, start_index:end_index, :] = y_emb_increasement
+        y_pos = self.ar_audio_position(y_emb[:, :end_index, :])
         # 与x输入拼接做attention准备
         xy_pos = torch.concat([x, y_pos], dim=1)
 
@@ -201,7 +196,15 @@ class T2SStageDecoder(nn.Module):
 
         y = torch.concat([y, samples], dim=1)
 
-        return y, cache["k"], cache["v"], cache["y_emb"], logits, samples
+        # 运行时判断kv cache 增量的大小
+        multipled = minus_one * first_infer * (x_seq_len + y_seq_len)
+        index_offset = torch.min(minus_one, multipled)
+        start_index = x_seq_len + y_seq_len + index_offset
+        end_index = x_seq_len + y_seq_len
+        k_increasement = cache["k"][start_index:end_index, :, :]
+        v_increasement = cache["v"][start_index:end_index, :, :]
+
+        return y, k_increasement, v_increasement, y_emb_increasement, logits, samples
 
 
 class Text2SemanticDecoder(nn.Module):

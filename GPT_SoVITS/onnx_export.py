@@ -198,8 +198,9 @@ class T2SInitStage(nn.Module):
 
         init_k = torch.zeros(((x_seq_len + y_seq_len), self.num_layers, 512), dtype=torch.float16)
         init_v = torch.zeros(((x_seq_len + y_seq_len), self.num_layers, 512), dtype=torch.float16)
+        init_y_emb = torch.zeros((1, y_seq_len, 512), dtype=torch.float16)
 
-        return x, prompt, init_k, init_v, x_seq_len, y_seq_len
+        return x, prompt, init_k, init_v, init_y_emb, x_seq_len, y_seq_len
 
 class T2SModel(nn.Module):
     def __init__(self, t2s_path, vits_model):
@@ -223,24 +224,25 @@ class T2SModel(nn.Module):
         self.stage_decoder = self.t2s_model.stage_decoder
 
     def forward(self, ref_seq, text_seq, ref_bert, text_bert, ssl_content, top_k=None, top_p=None, repetition_penalty=None, temperature=None):
-        x, prompt, init_k, init_v, x_seq_len, y_seq_len = self.init_stage(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
-        empty_tensor = torch.empty((1,0,512)).to(torch.float16)
+        x, prompt, init_k, init_v, init_y_emb, x_seq_len, y_seq_len = self.init_stage(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
         # first step
         y, k, v, y_emb, logits, samples = self.stage_decoder(x, prompt, init_k, init_v, 
-                          empty_tensor, 
+                          init_y_emb, 
                           top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature, 
                           first_infer=torch.LongTensor([1]), x_seq_len=x_seq_len, y_seq_len=y_seq_len)
 
         for idx in range(30): # This is a fake one! DO NOT take this as reference
             k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, 1))
             v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, 1))
+            y_emb = torch.nn.functional.pad(y_emb, (0, 0, 0, 1, 0, 0))
             y_seq_len = y.shape[1]
-            y, k, v, y_emb, logits, samples = self.stage_decoder(empty_tensor, y, k, v, 
+            y, k_increasement, v_increasement, y_emb_increasement, logits, samples = self.stage_decoder(x, y, k, v, 
                                                                  y_emb, 
                                                                  top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature, 
                                                                  first_infer=torch.LongTensor([0]), x_seq_len=x_seq_len, y_seq_len=y_seq_len)
-            # if torch.argmax(logits, dim=-1)[0] == self.t2s_model.EOS or samples[0, 0] == self.t2s_model.EOS:
-            #     break
+            k[-1:,:,:] = k_increasement
+            v[-1:,:,:] = v_increasement
+            y_emb[:,-1:,:] = y_emb_increasement
 
         return y[:, -30:].unsqueeze(0)
 
@@ -250,7 +252,7 @@ class T2SModel(nn.Module):
             (ref_seq, text_seq, ref_bert, text_bert, ssl_content),
             f"onnx/{project_name}/{project_name}_t2s_init_stage.onnx",
             input_names=["ref_text_phones", "input_text_phones", "ref_text_bert", "input_text_bert", "hubert_ssl_content"],
-            output_names=["x", "prompt", "init_k", "init_v", 'x_seq_len', 'y_seq_len'],
+            output_names=["x", "prompt", "init_k", "init_v", 'init_y_emb', 'x_seq_len', 'y_seq_len'],
             dynamic_axes={
                 "ref_text_phones": {1: "ref_text_phones_length"},
                 "input_text_phones": {1: "input_text_phones_length"},
@@ -262,18 +264,18 @@ class T2SModel(nn.Module):
             do_constant_folding=False
         )
         simplify_onnx_model(f"onnx/{project_name}/{project_name}_t2s_init_stage.onnx")
-        x, prompt, init_k, init_v, x_seq_len, y_seq_len = self.init_stage(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
-        empty_tensor = torch.empty((1,0,512)).to(torch.float16)
+        x, prompt, init_k, init_v, init_y_emb, x_seq_len, y_seq_len = self.init_stage(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
         x_seq_len = torch.Tensor([x_seq_len]).to(torch.int64)
         y_seq_len = torch.Tensor([y_seq_len]).to(torch.int64)
 
         y, k, v, y_emb, logits, samples = self.stage_decoder(x, prompt, init_k, init_v, 
-                                                             empty_tensor, 
+                                                             init_y_emb, 
                                                              top_k, top_p, repetition_penalty, temperature, 
                                                              torch.LongTensor([1]), x_seq_len, y_seq_len)
         print(y.shape, k.shape, v.shape, y_emb.shape, logits.shape, samples.shape)
         k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, 1))
         v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, 1))
+        y_emb = torch.nn.functional.pad(y_emb, (0, 0, 0, 1, 0, 0))
         y_seq_len = torch.Tensor([y.shape[1]]).to(torch.int64)
 
         torch.onnx.export(
@@ -281,7 +283,7 @@ class T2SModel(nn.Module):
             (x, y, k, v, y_emb, top_k, top_p, repetition_penalty, temperature, torch.LongTensor([0]), x_seq_len, y_seq_len),
             f"onnx/{project_name}/{project_name}_t2s_stage_decoder.onnx",
             input_names=["ix", "iy", "ik", "iv", "iy_emb", "top_k", "top_p", "repetition_penalty", "temperature", "if_init_step", "x_seq_len", "y_seq_len"],
-            output_names=["y", "k", "v", "y_emb", "logits", "samples"],
+            output_names=["y", "k_increasement", "v_increasement", "y_emb_increasement", "logits", "samples"],
             dynamic_axes={
                 "ix": {1: "ix_length"},
                 "iy": {1: "iy_length"},

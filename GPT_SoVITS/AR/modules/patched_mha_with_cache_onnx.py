@@ -58,11 +58,13 @@ def multi_head_attention_forward_patched(
     minus_one = torch.tensor([-1]).to(k.device).to(torch.int64)
     multipled = minus_one * cache["first_infer"] * (cache['x_seq_len'] + cache['y_seq_len'])
     index_offset = torch.min(minus_one, multipled)
+    start_index = cache['x_seq_len'] + cache['y_seq_len'] + index_offset
+    end_index = cache['x_seq_len'] + cache['y_seq_len']
     # 首次时 index 为 -N，后续index 为 -1
-    cache["k"][index_offset:, cache["stage"]:cache["stage"]+1, :] = k
-    cache["v"][index_offset:, cache["stage"]:cache["stage"]+1, :] = v
-    k = cache["k"][:, cache["stage"]:cache["stage"]+1, :]
-    v = cache["v"][:, cache["stage"]:cache["stage"]+1, :]
+    cache["k"][start_index:end_index, cache["stage"]:cache["stage"]+1, :] = k
+    cache["v"][start_index:end_index, cache["stage"]:cache["stage"]+1, :] = v
+    k = cache["k"][:end_index, cache["stage"]:cache["stage"]+1, :]
+    v = cache["v"][:end_index, cache["stage"]:cache["stage"]+1, :]
 
     cache["stage"] = (cache["stage"] + 1) % cache["all_stage"]
 

@@ -95,7 +95,7 @@ temperature = np.array([TEMPERATURE], dtype=np.float16)
 t2s_init_stage = ort.InferenceSession(MODEL_PATH+"_export_t2s_init_stage.onnx")
 # t2s_init_step = ort.InferenceSession(MODEL_PATH+"_export_t2s_init_step.onnx")
 
-[x, prompts, init_k, init_v, x_seq_len, y_seq_len] = t2s_init_stage.run(None, {
+[x, prompts, init_k, init_v, init_y_emb, x_seq_len, y_seq_len] = t2s_init_stage.run(None, {
     "input_text_phones": input_phones,
     "input_text_bert": input_bert,
     "ref_text_phones": ref_phones,
@@ -110,7 +110,7 @@ y, k, v, y_emb, logits, samples = t2s_stage_decoder.run(None, {
     "iy": prompts,
     "ik": init_k,
     "iv": init_v,
-    "iy_emb": empty_tensor,
+    "iy_emb": init_y_emb,
     "top_k": top_k,
     "top_p": top_p,
     "repetition_penalty": repetition_penalty,
@@ -123,9 +123,9 @@ y, k, v, y_emb, logits, samples = t2s_stage_decoder.run(None, {
 for idx in tqdm(range(1, 1500)):
     k = np.pad(k, ((0,1), (0,0), (0,0)))
     v = np.pad(v, ((0,1), (0,0), (0,0)))
+    y_emb = np.pad(y_emb, ((0,0), (0,1), (0,0)))
     y_seq_len = np.array([y.shape[1]]).astype(np.int64)
-    # [1, N] [N_layer, N, 1, 512] [N_layer, N, 1, 512] [1, N, 512] [1] [1, N, 512] [1, N]
-    [y, k, v, y_emb, logits, samples] = t2s_stage_decoder.run(None, {
+    [y, k_increasement, v_increasement, y_emb_increasement, logits, samples] = t2s_stage_decoder.run(None, {
         "ix": empty_tensor,
         "iy": y,
         "ik": k,
@@ -139,6 +139,9 @@ for idx in tqdm(range(1, 1500)):
         "x_seq_len": np.array([x_seq_len]).astype(np.int64),
         "y_seq_len": y_seq_len
     })
+    k[-1:,:,:] = k_increasement
+    v[-1:,:,:] = v_increasement
+    y_emb[:,-1:,:] = y_emb_increasement
     if np.argmax(logits, axis=-1)[0] == 1024 or samples[0, 0] == 1024: # 1024 is the EOS token
         break
 y = y[:,:-1]
