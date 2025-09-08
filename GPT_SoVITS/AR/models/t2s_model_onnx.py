@@ -31,8 +31,8 @@ def logits_to_probs(
     top_p=None,
     repetition_penalty: float = 1.0,
 ):
-    previous_tokens = previous_tokens.squeeze()
     if previous_tokens is not None and repetition_penalty != 1.0:
+        previous_tokens = previous_tokens.squeeze()
         previous_tokens = previous_tokens.long()
         score = torch.gather(logits, dim=0, index=previous_tokens)
         score = torch.where(
@@ -137,14 +137,12 @@ class T2SFirstStageDecoder(nn.Module):
             "all_stage": self.num_layers,
             "k": None,
             "v": None,
-            "y_emb": None,
             "first_infer": 1,
             "stage": 0,
         }
 
         y_emb = self.ar_audio_embedding(y)
 
-        cache["y_emb"] = y_emb
         y_pos = self.ar_audio_position(y_emb)
 
         xy_pos = torch.concat([x, y_pos], dim=1)
@@ -169,21 +167,18 @@ class T2SFirstStageDecoder(nn.Module):
         cache["k"] = (
             torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)))
             .unsqueeze(1)
-            .repeat(self.num_layers, 1, 1, 1)
+            .repeat(1, self.num_layers, 1)
         )
         cache["v"] = (
             torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)))
             .unsqueeze(1)
-            .repeat(self.num_layers, 1, 1, 1)
+            .repeat(1, self.num_layers, 1)
         )
 
         xy_dec = self.h(xy_pos, mask=xy_attn_mask, cache=cache)
         logits = self.ar_predict_layer(xy_dec[:, -1])
-        samples = sample(logits[0], y, top_k=self.top_k, top_p=1.0, repetition_penalty=1.35)[0].unsqueeze(0)
 
-        y = torch.concat([y, samples], dim=1)
-
-        return y, cache["k"], cache["v"], cache["y_emb"], x_example
+        return cache["k"], cache["v"], y_emb, x_example, logits[0]
 
 
 class T2SStageDecoder(nn.Module):
@@ -213,21 +208,14 @@ class T2SStageDecoder(nn.Module):
     def forward(self, y, k, v, y_emb, x_example):
         cache = {
             "all_stage": self.num_layers,
-            "k": torch.nn.functional.pad(k, (0, 0, 0, 0, 0, 1)),
-            "v": torch.nn.functional.pad(v, (0, 0, 0, 0, 0, 1)),
-            "y_emb": y_emb,
+            "k": k,
+            "v": v,
             "first_infer": 0,
             "stage": 0,
         }
 
-        y_emb = torch.cat(
-            [
-                cache["y_emb"],
-                self.ar_audio_embedding(y[:, -1:]),
-            ],
-            1,
-        )
-        cache["y_emb"] = y_emb
+        y_emb[:, -1:] = self.ar_audio_embedding(y[:, -1])
+
         y_pos = self.ar_audio_position(y_emb)
 
         xy_pos = y_pos[:, -1:]
@@ -239,11 +227,11 @@ class T2SStageDecoder(nn.Module):
 
         xy_dec = self.h(xy_pos, mask=xy_attn_mask, cache=cache)
         logits = self.ar_predict_layer(xy_dec[:, -1])
-        samples = sample(logits[0], y, top_k=self.top_k, top_p=1.0, repetition_penalty=1.35)[0].unsqueeze(0)
 
-        y = torch.concat([y, samples], dim=1)
+        k_increasement = cache["k"][-1:, :, :]
+        v_increasement = cache["v"][-1:, :, :]
 
-        return y, cache["k"], cache["v"], cache["y_emb"], logits, samples
+        return k_increasement, v_increasement, y_emb[:, -1:], logits[0]
 
 
 class Text2SemanticDecoder(nn.Module):

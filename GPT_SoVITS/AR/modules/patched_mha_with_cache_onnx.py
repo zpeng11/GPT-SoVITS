@@ -1,3 +1,4 @@
+from typing import Optional, Tuple
 from torch.nn.functional import *
 from torch.nn.functional import (
     _canonical_mask,
@@ -45,18 +46,19 @@ def multi_head_attention_forward_patched(
     head_dim = embed_dim // num_heads
 
     proj_qkv = linear(query, in_proj_weight, in_proj_bias)
-    proj_qkv = proj_qkv.unflatten(-1, (3, query.size(-1))).unsqueeze(0).transpose(0, -2).squeeze(-2).contiguous()
-    q, k, v = proj_qkv[0], proj_qkv[1], proj_qkv[2]
+    #直接截取省去视图访问开销
+    q, k, v = proj_qkv[:, :, :512], proj_qkv[:, :, 512:1024], proj_qkv[:, :, 1024:]
 
+    stage_num = cache["stage"]
     if cache["first_infer"] == 1:
-        cache["k"][cache["stage"]] = k
-        cache["v"][cache["stage"]] = v
+        cache["k"][:, stage_num:stage_num+1, :] = k
+        cache["v"][:, stage_num:stage_num+1, :] = v
     else:
-        cache["k"][cache["stage"]] = torch.cat([cache["k"][cache["stage"]][:-1], k], 0)
-        cache["v"][cache["stage"]] = torch.cat([cache["v"][cache["stage"]][:-1], v], 0)
-        k = cache["k"][cache["stage"]]
-        v = cache["v"][cache["stage"]]
-    cache["stage"] = (cache["stage"] + 1) % cache["all_stage"]
+        cache["k"][-1:, stage_num:stage_num+1, :] = k
+        cache["v"][-1:, stage_num:stage_num+1, :] = v
+        k = cache["k"][:, stage_num:stage_num+1, :]
+        v = cache["v"][:, stage_num:stage_num+1, :]
+    cache["stage"] = (stage_num + 1) % cache["all_stage"]
 
     attn_mask = _canonical_mask(
         mask=attn_mask,

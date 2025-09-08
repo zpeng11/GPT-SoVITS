@@ -30,3 +30,15 @@ class SV:
             )
             sv_emb = self.embedding_model.forward3(feat)
         return sv_emb
+
+    def compute_embedding3_onnx(self, wav):
+        # Disable gradients for all parameters
+        for param in self.embedding_model.parameters():
+            param.requires_grad = False
+
+        with torch.no_grad():
+            if wav.dtype == torch.float16:
+                self.embedding_model.half()
+            feat = Kaldi.fbank_onnx(wav).unsqueeze(0)
+            sv_emb = self.embedding_model.forward3(feat)
+        return sv_emb
