@@ -13,6 +13,7 @@ __all__ = [
     "mel_scale_scalar",
     "spectrogram",
     "fbank",
+    "fbank_onnx"
     "mfcc",
     "vtln_warp_freq",
     "vtln_warp_mel_freq",
@@ -842,3 +843,205 @@ def mfcc(
 
     feature = _subtract_column_mean(feature, subtract_mean)
     return feature
+
+def _get_log_energy_onnx(strided_input: Tensor, epsilon: Tensor, energy_floor: float = 1.0) -> Tensor:
+    """Returns the log energy of size (m) for a strided_input (m,*)"""
+    log_energy = torch.max(strided_input.pow(2).sum(1), epsilon).log()
+    return torch.max(log_energy, torch.tensor(0.0, device=strided_input.device, dtype=strided_input.dtype))
+
+
+def _get_waveform_and_window_properties_onnx(waveform: Tensor) -> Tuple[Tensor, int, int, int]:
+    """Extract waveform and window properties with hardcoded parameters for ONNX compatibility."""
+    # Extract channel 0 (channel=-1 -> 0 after max(channel, 0))
+    waveform_selected = waveform if waveform.dim() == 1 else waveform[0, :]
+
+    # Hardcoded values: 16kHz sample rate, 10ms shift, 25ms window, padded to power of 2
+    return waveform_selected, 160, 400, 512
+
+def _get_window_onnx(waveform: Tensor) -> Tuple[Tensor, Tensor]:
+    """Apply windowing with povey window and preemphasis for ONNX compatibility.
+
+    Returns:
+        (Tensor, Tensor): strided_input of size (m, 512) and signal_log_energy of size (m)
+    """
+    strided_input = _get_strided_onnx(waveform, 400, 160, True)
+
+    # Remove DC offset
+    row_means = torch.mean(strided_input, dim=1, keepdim=True)
+    strided_input = strided_input - row_means
+
+    # Calculate log energy before preemphasis and windowing
+    signal_log_energy = _get_log_energy_onnx(strided_input, _get_epsilon(strided_input.device, strided_input.dtype))
+
+    # Apply preemphasis (coefficient=0.97)
+    offset_strided_input = torch.nn.functional.pad(strided_input.unsqueeze(0), (1, 0), mode="replicate").squeeze(0)
+    strided_input = strided_input - 0.97 * offset_strided_input[:, :-1]
+
+    # Apply povey window (hanning window ^ 0.85)
+    window_function = torch.hann_window(400, periodic=False, device=strided_input.device, dtype=strided_input.dtype).pow(0.85).unsqueeze(0)
+    strided_input = strided_input * window_function
+
+    # Pad from 400 to 512 samples
+    strided_input = torch.nn.functional.pad(strided_input, (0, 112), mode="constant", value=0)
+
+    return strided_input, signal_log_energy
+
+
+def _get_strided_onnx(waveform: Tensor, window_size=400, window_shift=160, snip_edges=True) -> Tensor:
+    """Extract strided windows from waveform for ONNX compatibility."""
+    num_windows = 1 + (waveform.size(0) - window_size) // window_shift
+    window_starts = torch.arange(0, num_windows * window_shift, window_shift, device=waveform.device)
+    window_indices = window_starts.unsqueeze(1) + torch.arange(window_size, device=waveform.device)
+    return waveform[window_indices]
+
+
+def _subtract_column_mean_onnx(tensor: Tensor) -> Tensor:
+    """Return tensor unchanged (subtract_mean=False for ONNX compatibility)."""
+    return tensor
+
+
+def get_mel_banks_onnx(device=None, dtype=None) -> Tensor:
+    """Generate mel filter banks for ONNX compatibility (80 bins, 16kHz).
+
+    Returns:
+        Tensor: melbank of size (80, 256)
+    """
+    num_bins = 80
+    window_length_padded = 512
+    sample_freq = 16000.0
+    low_freq = 20.0
+    high_freq = 8000.0  # nyquist frequency
+
+    # Calculate filter bank parameters
+    num_fft_bins = 256
+    fft_bin_width = sample_freq / window_length_padded  # 31.25
+    mel_low_freq = mel_scale_scalar(low_freq)
+    mel_high_freq = mel_scale_scalar(high_freq)
+    mel_freq_delta = (mel_high_freq - mel_low_freq) / (num_bins + 1)
+
+    # Create mel bin centers
+    bin_indices = torch.arange(num_bins, device=device, dtype=dtype).unsqueeze(1)
+    left_mel = mel_low_freq + bin_indices * mel_freq_delta
+    center_mel = mel_low_freq + (bin_indices + 1.0) * mel_freq_delta
+    right_mel = mel_low_freq + (bin_indices + 2.0) * mel_freq_delta
+
+    # Create triangular filter banks
+    fft_freqs = fft_bin_width * torch.arange(num_fft_bins, device=device, dtype=dtype)
+    mel = mel_scale(fft_freqs).unsqueeze(0)
+    up_slope = (mel - left_mel) / (center_mel - left_mel)
+    down_slope = (right_mel - mel) / (right_mel - center_mel)
+
+    return torch.max(torch.zeros(1, device=device, dtype=dtype), torch.min(up_slope, down_slope))
+
+
+def fbank_onnx(waveform: Tensor, num_mel_bins=80, sample_frequency=16000, dither=0) -> Tensor:
+    """ONNX-compatible fbank function for feature extraction.
+
+    Args:
+        waveform (Tensor): Tensor of audio of size (c, n) where c is in [0,2)
+
+    Returns:
+        Tensor: Filterbank features of shape (m, 80)
+    """
+    device, dtype = waveform.device, waveform.dtype
+
+    # Extract waveform and apply windowing
+    waveform_selected, _, _, _ = _get_waveform_and_window_properties_onnx(waveform)
+    strided_input, _ = _get_window_onnx(waveform_selected)
+
+    # Compute STFT magnitude spectrum using batch processing
+    batched_frames = strided_input.unsqueeze(1)  # (m, 1, 512)
+    rectangular_window = torch.ones(512, device=device, dtype=dtype)
+
+    # Handle float16 conversion
+    original_dtype = batched_frames.dtype
+    if original_dtype == torch.float16:
+        batched_frames = batched_frames.float()
+
+    # Apply STFT to all frames
+    stft_result = torch.stft(
+        batched_frames.flatten(0, 1),  # (m, 512)
+        n_fft=512,
+        hop_length=512,
+        window=rectangular_window,
+        center=False,
+        return_complex=False
+    )
+
+    if original_dtype == torch.float16:
+        stft_result = stft_result.half()
+
+    # Calculate magnitude spectrum
+    real_part = stft_result[..., 0]  # (m, 257, 1)
+    imag_part = stft_result[..., 1]  # (m, 257, 1)
+    spectrum = torch.sqrt(real_part.pow(2) + imag_part.pow(2)).squeeze(-1)  # (m, 257)
+    spectrum = spectrum.pow(2.0)  # Use power spectrum
+
+    # Apply mel filter banks
+    mel_energies = get_mel_banks_onnx(device, dtype)
+    mel_energies = torch.nn.functional.pad(mel_energies, (0, 1), mode="constant", value=0)
+    mel_energies = torch.mm(spectrum, mel_energies.T)
+
+    # Apply log compression
+    mel_energies = torch.max(mel_energies, _get_epsilon(device, dtype)).log()
+
+    return _subtract_column_mean_onnx(mel_energies)
+
+# Test to compare original fbank vs fbank_onnx
+if __name__ == "__main__":
+    import torch
+
+    print("Testing fbank vs fbank_onnx...")
+
+    # Create test waveform
+    torch.manual_seed(42)
+    sample_rate = 16000
+    duration = 1.0
+    num_samples = int(sample_rate * duration)
+    t = torch.linspace(0, duration, num_samples)
+    frequency = 440.0  # A4 note
+    waveform = torch.sin(2 * torch.pi * frequency * t) + 0.1 * torch.randn(num_samples)
+    mono_waveform = waveform.unsqueeze(0)  # Shape: (1, num_samples)
+
+    print(f"Test waveform shape: {mono_waveform.shape}")
+
+    try:
+        # Original fbank
+        original_result = fbank(mono_waveform, num_mel_bins=80, sample_frequency=16000, dither=0)
+
+        # ONNX-compatible fbank
+        onnx_result = fbank_onnx(mono_waveform)
+
+        print(f"Original fbank output shape: {original_result.shape}")
+        print(f"ONNX fbank output shape: {onnx_result.shape}")
+
+        # Check if shapes match
+        if original_result.shape == onnx_result.shape:
+            print("✅ Output shapes match")
+
+            # Check numerical differences
+            diff = torch.abs(original_result - onnx_result)
+            max_diff = torch.max(diff).item()
+            mean_diff = torch.mean(diff).item()
+
+            print(f"Max absolute difference: {max_diff:.2e}")
+            print(f"Mean absolute difference: {mean_diff:.2e}")
+
+            # Check if results are numerically close
+            tolerance = 1e-5
+            if max_diff < tolerance:
+                print(f"✅ Results are numerically identical (within {tolerance})")
+            else:
+                print(f"❌ Results differ by more than {tolerance}")
+
+            print(f"Original result range: [{torch.min(original_result).item():.3f}, {torch.max(original_result).item():.3f}]")
+            print(f"ONNX result range: [{torch.min(onnx_result).item():.3f}, {torch.max(onnx_result).item():.3f}]")
+        else:
+            print("❌ Output shapes don't match")
+            print(f"  Original: {original_result.shape}")
+            print(f"  ONNX: {onnx_result.shape}")
+
+    except Exception as e:
+        print(f"❌ Error during testing: {e}")
+        import traceback
+        traceback.print_exc()

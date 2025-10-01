@@ -122,6 +122,10 @@ def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size,
     )
     y = y.squeeze(1)
 
+    # SFT ONNX does not support float16
+    original_dtype = y.dtype
+    if y.dtype == torch.float16:
+        y = y.float()
     spec = torch.stft(
         y,
         n_fft,
@@ -134,6 +138,8 @@ def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size,
         onesided=True,
         return_complex=False,
     )
+    if original_dtype == torch.float16:
+        spec = spec.half()
 
     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-8)
 
