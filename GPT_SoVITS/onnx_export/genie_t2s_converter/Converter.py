@@ -1,5 +1,3 @@
-import sys, os
-sys.path.append(os.path.dirname(__file__))  # 或者上层目录
 from T2SConverter import T2SModelConverter
 from EncoderConverter import EncoderConverter
 
