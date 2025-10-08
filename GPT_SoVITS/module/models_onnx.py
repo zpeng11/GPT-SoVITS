@@ -205,8 +205,6 @@ class TextEncoder(nn.Module):
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, y, text, ge, speed=1):
-        if type(speed) == float or type(speed) == int:
-            speed = torch.FloatTensor([speed])
         y_mask = torch.ones_like(y[:1, :1, :])
 
         y = self.ssl_proj(y * y_mask) * y_mask
@@ -219,9 +217,9 @@ class TextEncoder(nn.Module):
         y = self.mrte(y, y_mask, text, text_mask, ge)
 
         y = self.encoder2(y * y_mask, y_mask)
-        # Take speed into account, this would require dynamic shape in ONNX
-        y = F.interpolate(y, size=(y.shape[-1] / speed).to(torch.int), mode="linear")
-        y_mask = F.interpolate(y_mask, size=y.shape[-1], mode="nearest")
+        if speed != 1:
+            y = F.interpolate(y, size=int(y.shape[-1] / speed) + 1, mode="linear")
+            y_mask = F.interpolate(y_mask, size=y.shape[-1], mode="nearest")
 
         stats = self.proj(y) * y_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -960,50 +958,6 @@ class CFM(torch.nn.Module):
             x[:, :, :prompt_len] = 0.0
         return x
 
-class CFMOnnx(torch.nn.Module):
-    def __init__(self, in_channels, dit):
-        super().__init__()
-        self.estimator = dit
-        self.in_channels = in_channels
-
-    def forward(
-        self,
-        mu: torch.Tensor,
-        prompt: torch.Tensor,
-        n_timesteps: torch.LongTensor,
-        i_timestep: torch.LongTensor,
-        temperature: torch.Tensor,
-        x_last: torch.Tensor,
-        text_cache: torch.Tensor,
-        dt_cache: torch.Tensor
-    ):
-        """Forward diffusion"""
-        x_lens = torch.onnx.operators.shape_as_tensor(mu)[1:2]
-        B, T = mu.size(0), mu.size(1)
-
-        #如果x_last 存在，使用x_last, 否则初始化使用randn，常数级代价
-        x = torch.randn([B, self.in_channels, T], device=mu.device).to(mu.dtype) * temperature
-        x = torch.cat([x, x_last], dim=0)[-B:, :, :]
-
-
-        prompt_len = prompt.size(-1)
-        prompt_x = torch.zeros_like(x, dtype=mu.dtype)
-        prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
-        x[..., :prompt_len] = 0.0
-        mu = mu.transpose(2, 1)
-        t = torch.tensor(0.0, dtype=mu.dtype, device=mu.device)
-        d = (1.0 / n_timesteps).to(mu.dtype)
-        t = (t + d * i_timestep).to(mu.dtype)
-        d_tensor = torch.ones(x.size(0), device=x.device, dtype=mu.dtype) * d
-        t_tensor = torch.ones(x.size(0), device=x.device, dtype=mu.dtype) * t
-
-        # text_cache_empty = torch.empty((0, T, 512), dtype=x.dtype).to(x.device)
-        # dt_cache_empty = torch.empty((0, 1024), dtype=x.dtype).to(x.device)
-
-        v_pred, text_embed, dt = self.estimator.infer(x, prompt_x, x_lens, t_tensor, d_tensor, mu, text_cache, dt_cache)
-        v_pred = v_pred.transpose(2, 1)
-        x = x + d * v_pred
-        return x, text_embed, dt
 
 def set_no_grad(net_g):
     for name, param in net_g.named_parameters():
@@ -1013,7 +967,7 @@ def set_no_grad(net_g):
 @torch.jit.script_if_tracing
 def compile_codes_length(codes):
     y_lengths1 = torch.LongTensor([codes.size(2)]).to(codes.device)
-    return y_lengths1
+    return y_lengths1 * 2.5 * 1.5
 
 
 @torch.jit.script_if_tracing
@@ -1115,14 +1069,14 @@ class SynthesizerTrnV3(nn.Module):
         return ge
 
     def forward(self, codes, text, ge, speed=1):
-        y_lengths1 = compile_codes_length(codes) * (3.875 if self.version == "v3" else 4)
+        y_lengths1 = compile_codes_length(codes)
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
             quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")  ##BCT
         x, m_p, logs_p, y_mask = self.enc_p(quantized, text, ge, speed)
         fea = self.bridge(x)
-        fea = F.interpolate(fea, scale_factor=(1.875 if self.version == "v3" else 2), mode="nearest") ##BCT
+        fea = F.interpolate(fea, scale_factor=1.875, mode="nearest") ##BCT
         ####more wn paramter to learn mel
         fea, y_mask_ = self.wns1(fea, y_lengths1, ge)
         return fea
