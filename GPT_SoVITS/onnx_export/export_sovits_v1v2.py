@@ -160,7 +160,7 @@ def export_sovits_v1v2_to_onnx(
         "--optimizePrefer", "2",
         "--MNNModel", sovits_mnn_path,
         "--weightQuantBits", "8",
-        "--fp16"
+        "--weightQuantBlock", "32",
     ]
 
     try:

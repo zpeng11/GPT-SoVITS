@@ -118,6 +118,7 @@ class T2SModelConverter:
         fp16_array = np.fromfile(fp16_bin_path, dtype=np.float16)
         fp32_array = fp16_array.astype(np.float32)
         fp32_array.tofile(output_fp32_bin_path)
+        os.remove(fp16_bin_path)
 
     def run_full_process(self):
         self.step1_create_fp16_bin_with_key_mapping()
