@@ -55,7 +55,7 @@ def load_and_preprocess_audio(audio_path):
 
     print(f"Processed waveform shape: {waveform.shape}")
 
-    return waveform  # Return half precision for consistency
+    return waveform  # Return full precision
 
 
 def norm_spec(x):
@@ -148,7 +148,6 @@ class AudioPreprocess(nn.Module):
         # Load the model
         self.model = HubertModel.from_pretrained(cnhubert_base_path, local_files_only=True)
         self.model.eval()
-        self.model.half()
 
         self.sv_model = SV("cpu", False)
 
@@ -180,13 +179,14 @@ def export_audio_preprocess_to_onnx(
     cnhubert_base_path: str = "GPT_SoVITS/pretrained_models/chinese-hubert-base",
     output_dir: str = "onnx/audio-preprocess"
 ):
-    """Export AudioPreprocess model to ONNX format (half-precision)"""
+    """Export AudioPreprocess model to ONNX format (full precision)"""
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
     # Set output paths
     onnx_path = os.path.join(output_dir, "audio-preprocess.onnx")
+    mnn_path = os.path.join(output_dir, "audio-preprocess.mnn")
 
     print(f"Loading AudioPreprocess model with HuBERT from: {cnhubert_base_path}")
 
@@ -194,11 +194,11 @@ def export_audio_preprocess_to_onnx(
     preprocessor = AudioPreprocess(cnhubert_base_path)
     preprocessor.eval()
 
-    # # Create dummy input (5 seconds at 32kHz) - use float16 for half-precision export
-    dummy_input = torch.randn((1, 32000 * 5), dtype=torch.float16) - 0.5
+    # # Create dummy input (5 seconds at 32kHz) - use float32 for full precision export
+    dummy_input = torch.randn((1, 32000 * 5), dtype=torch.float32) - 0.5
 
     # Export to ONNX
-    print(f"Exporting half-precision model to ONNX: {onnx_path}")
+    print(f"Exporting full precision model to ONNX: {onnx_path}")
     torch.onnx.export(
         preprocessor,
         dummy_input,
@@ -218,21 +218,44 @@ def export_audio_preprocess_to_onnx(
     model, _ = onnxsim.simplify(onnx_path)
     onnx.save(model, onnx_path)
 
-    print(f"Half-precision model exported successfully to: {onnx_path}")
+    print(f"Full precision model exported successfully to: {onnx_path}")
 
-    return preprocessor, onnx_path
+    # Export to MNN format
+    print(f"Exporting to MNN: {mnn_path}")
+    mnn_command = [
+        "mnnconvert",
+        "--f", "ONNX",
+        "--modelFile", onnx_path,
+        "--optimizeLevel", "2",
+        "--optimizePrefer", "2",
+        "--MNNModel", mnn_path,
+        "--weightQuantBits", "8",
+        "--weightQuantBlock", "128",
+        "--fp16"
+    ]
+
+    try:
+        subprocess.run(mnn_command, check=True, capture_output=True, text=True)
+        print(f"Successfully exported to MNN: {mnn_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error exporting to MNN: {e}")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        mnn_path = None
+
+    return preprocessor, onnx_path, mnn_path
 
 
-def test_model_equivalence(original_model, onnx_path: str, test_audio_url: str = TEST_AUDIO_URL):
-    """Test if the original PyTorch model and ONNX model produce the same outputs"""
+def test_model_equivalence(original_model, onnx_path: str, mnn_path: str = None, test_audio_url: str = TEST_AUDIO_URL):
+    """Test if the original PyTorch model, ONNX model, and MNN model produce similar outputs"""
 
-    print("Testing model equivalence (half-precision)...")
+    print("Testing model equivalence (full precision)...")
     print(f"Using test audio: {test_audio_url}")
 
     # Load and preprocess audio
-    waveform = load_and_preprocess_audio(test_audio_url).half()
+    waveform = load_and_preprocess_audio(test_audio_url)
 
-    # Get PyTorch output (use half precision)
+    # Get PyTorch output (use full precision)
     print("Running PyTorch inference...")
     original_model.eval()
     with torch.no_grad():
@@ -282,16 +305,95 @@ def test_model_equivalence(original_model, onnx_path: str, test_audio_url: str =
     print(f"Mel2_v4 - Mean diff: {mel_mean_diff:.6f}, Max diff: {mel_max_diff:.6f}")
     print(f"PyTorch Mel shape: {torch_mel_float.shape}, ONNX Mel shape: {onnx_mel_float.shape}")
 
-    # Overall success check
-    all_success = (ssl_mean_diff < 1e-2 and spec_mean_diff < 1e-2 and
-                   sv_mean_diff < 1e-2 and mel_mean_diff < 1e-2)
+    # Overall success check (using tighter tolerance for full precision)
+    onnx_success = (ssl_mean_diff < 1e-4 and spec_mean_diff < 1e-4 and
+                    sv_mean_diff < 1e-4 and mel_mean_diff < 1e-3)
 
-    if all_success:
+    if onnx_success:
         print("✅ PyTorch and ONNX models are numerically equivalent!")
     else:
         print("❌ PyTorch and ONNX models have significant differences!")
 
-    return all_success
+    # Test MNN model if path is provided
+    mnn_success = True
+    if mnn_path and os.path.exists(mnn_path):
+        print("\nTesting MNN model...")
+        try:
+            import MNN
+            import MNN.numpy as mnp
+
+            mnn_config = {}
+            mnn_config['backend'] = 'CPU'
+            mnn_config['thread'] = 12
+            mnn_rt = MNN.nn.create_runtime_manager((mnn_config,))
+
+            audio_preprocess_mnn = MNN.nn.load_module_from_file(
+                mnn_path,
+                ['audio32k'],
+                ['hubert_ssl_output', 'spectrum', 'sv_emb', 'mel2_v4'],
+                runtime_manager=mnn_rt
+            )
+
+            # Prepare inputs for MNN (convert to float32 for MNN)
+            mnn_inputs = [mnp.array(waveform.numpy().astype(np.float32))]
+
+            mnn_outputs = audio_preprocess_mnn(mnn_inputs)
+            mnn_ssl_content = np.array(mnn_outputs[0].read())
+            mnn_spectrum = np.array(mnn_outputs[1].read())
+            mnn_sv_emb = np.array(mnn_outputs[2].read())
+            mnn_mel2_v4 = np.array(mnn_outputs[3].read())
+
+            print(f"MNN SSL shape: {mnn_ssl_content.shape}")
+            print(f"MNN Spectrum shape: {mnn_spectrum.shape}")
+            print(f"MNN SV shape: {mnn_sv_emb.shape}")
+            print(f"MNN Mel shape: {mnn_mel2_v4.shape}")
+
+            # Compare MNN with PyTorch
+            print("\nComparing PyTorch and MNN outputs:")
+
+            # SSL Content comparison
+            ssl_mean_diff_mnn = np.abs(torch_ssl_float - mnn_ssl_content).mean()
+            ssl_max_diff_mnn = np.abs(torch_ssl_float - mnn_ssl_content).max()
+            print(f"SSL Content - Mean diff: {ssl_mean_diff_mnn:.6f}, Max diff: {ssl_max_diff_mnn:.6f}")
+
+            # Spectrum comparison
+            spec_mean_diff_mnn = np.abs(torch_spec_float - mnn_spectrum).mean()
+            spec_max_diff_mnn = np.abs(torch_spec_float - mnn_spectrum).max()
+            print(f"Spectrum - Mean diff: {spec_mean_diff_mnn:.6f}, Max diff: {spec_max_diff_mnn:.6f}")
+
+            # SV Embedding comparison
+            sv_mean_diff_mnn = np.abs(torch_sv_float - mnn_sv_emb).mean()
+            sv_max_diff_mnn = np.abs(torch_sv_float - mnn_sv_emb).max()
+            print(f"SV Embedding - Mean diff: {sv_mean_diff_mnn:.6f}, Max diff: {sv_max_diff_mnn:.6f}")
+
+            # Mel2_v4 comparison
+            mel_mean_diff_mnn = np.abs(torch_mel_float - mnn_mel2_v4).mean()
+            mel_max_diff_mnn = np.abs(torch_mel_float - mnn_mel2_v4).max()
+            print(f"Mel2_v4 - Mean diff: {mel_mean_diff_mnn:.6f}, Max diff: {mel_max_diff_mnn:.6f}")
+
+            # Check MNN equivalence (using higher tolerance for quantized MNN)
+            mnn_success = (ssl_mean_diff_mnn < 1e-2 and spec_mean_diff_mnn < 1e-2 and
+                          sv_mean_diff_mnn < 1e-2 and mel_mean_diff_mnn < 1e-2)
+
+            if mnn_success:
+                print("✅ MNN and PyTorch models are numerically equivalent!")
+            else:
+                print("❌ MNN and PyTorch models have significant differences!")
+
+        except Exception as e:
+            print(f"❌ Error testing MNN model: {e}")
+            mnn_success = False
+    else:
+        print("MNN model path not provided or file does not exist, skipping MNN test")
+
+    overall_success = onnx_success and (mnn_success if mnn_path else onnx_success)
+
+    if overall_success:
+        print("\n✨ All models are numerically equivalent!")
+    else:
+        print("\n⚠️  Some models have significant differences.")
+
+    return overall_success
 
 
 def main():
@@ -322,7 +424,7 @@ def main():
 
     try:
         # Export model
-        original_model, onnx_path = export_audio_preprocess_to_onnx(
+        original_model, onnx_path, mnn_path = export_audio_preprocess_to_onnx(
             cnhubert_base_path=args.cnhubert_base_path,
             output_dir=args.output_dir
         )
@@ -331,10 +433,11 @@ def main():
         test_model_equivalence(
             original_model=original_model,
             onnx_path=onnx_path,
+            mnn_path=mnn_path,
             test_audio_url=args.test_audio_url
         )
 
-        print("\n✨ All done! Your half-precision ONNX AudioPreprocess model is ready to use.")
+        print("\n✨ All done! Your full precision ONNX and MNN AudioPreprocess models are ready to use.")
         return 0
 
     except Exception as e:

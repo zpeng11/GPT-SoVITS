@@ -81,7 +81,7 @@ class VitsV1V2Model(nn.Module):
             )
         self.vq_model.eval()
         self.vq_model.load_state_dict(dict_s2["weight"], strict=False)
-        self.vq_model.half()
+        # self.vq_model.half()
         # print(f"filter_length:{self.hps.data.filter_length} sampling_rate:{self.hps.data.sampling_rate} hop_length:{self.hps.data.hop_length} win_length:{self.hps.data.win_length}")
         #v2 filter_length: 2048 sampling_rate: 32000 hop_length: 640 win_length: 2048
     def forward(self, text_seq, pred_semantic, spectrum, sv_emb):
@@ -111,8 +111,8 @@ def export_sovits_v1v2_to_onnx(
     # Create dummy input
     text_seq_rand = torch.randint(0, 100, (1, 20), dtype=torch.int64)
     pred_semantic_rand = torch.randint(1, 100, (1, 1, 30)).to(torch.int64)
-    spectrum_rand = torch.randn(1, 1025, 30).to(torch.float16)
-    sv_emb_rand = torch.randn(1, 20480).to(torch.float16)
+    spectrum_rand = torch.randn(1, 1025, 30).to(torch.float32)
+    sv_emb_rand = torch.randn(1, 20480).to(torch.float32)
 
     # Export to ONNX
     print(f"Exporting SoVITS v1/v2/v2p/v2pp to ONNX: {sovits_onnx_path}")
@@ -121,7 +121,7 @@ def export_sovits_v1v2_to_onnx(
         (text_seq_rand, pred_semantic_rand, spectrum_rand, sv_emb_rand),
         sovits_onnx_path,
         input_names=["input_text_phones", "pred_semantic", "spectrum", "sv_emb"],
-        output_names=["audio"],
+        output_names=["audio32k"],
         dynamic_axes={
             "input_text_phones": {1: "text_length"},
             "pred_semantic": {2: "pred_length"},
@@ -156,10 +156,10 @@ def export_sovits_v1v2_to_onnx(
         "mnnconvert",
         "--f", "ONNX",
         "--modelFile", sovits_onnx_path,
-        "--optimizeLevel", "1",
-        "--optimizePrefer", "1",
+        "--optimizeLevel", "2",
+        "--optimizePrefer", "2",
         "--MNNModel", sovits_mnn_path,
-        # "--weightQuantBits", "8"
+        "--weightQuantBits", "8",
         "--fp16"
     ]
 
@@ -188,8 +188,8 @@ def test_model(original_model, onnx_path: str, mnn_path: str = None):
 
     text_seq_rand = torch.randint(0, 100, (batch_size, text_length), dtype=torch.int64)
     pred_semantic_rand = torch.randint(1, 100, (batch_size, 1, pred_length)).to(torch.int64)
-    spectrum_rand = torch.randn(batch_size, 1025, spectrum_length).to(torch.float16)
-    sv_emb_rand = torch.randn(batch_size, 20480).to(torch.float16)
+    spectrum_rand = torch.randn(batch_size, 1025, spectrum_length).to(torch.float32)
+    sv_emb_rand = torch.randn(batch_size, 20480).to(torch.float32)
 
     # Get PyTorch output
     print("Running PyTorch inference...")
@@ -203,8 +203,8 @@ def test_model(original_model, onnx_path: str, mnn_path: str = None):
     ort_inputs = {
         ort_session.get_inputs()[0].name: text_seq_rand.numpy(),
         ort_session.get_inputs()[1].name: pred_semantic_rand.numpy(),
-        ort_session.get_inputs()[2].name: spectrum_rand.numpy().astype(np.float16),
-        ort_session.get_inputs()[3].name: sv_emb_rand.numpy().astype(np.float16),
+        ort_session.get_inputs()[2].name: spectrum_rand.numpy().astype(np.float32),
+        ort_session.get_inputs()[3].name: sv_emb_rand.numpy().astype(np.float32),
     }
     ort_outputs = ort_session.run(None, ort_inputs)
     onnx_output = ort_outputs[0]
@@ -235,7 +235,7 @@ def test_model(original_model, onnx_path: str, mnn_path: str = None):
             sovits_mnn = MNN.nn.load_module_from_file(
                 mnn_path,
                 ["input_text_phones", "pred_semantic", "spectrum", "sv_emb"],
-                ['audio'],
+                ['audio32k'],
                 runtime_manager=mnn_rt
             )
 
@@ -248,11 +248,7 @@ def test_model(original_model, onnx_path: str, mnn_path: str = None):
             ]
 
             mnn_result = sovits_mnn(mnn_inputs)
-            print(f"mnn_result: {mnn_result}")
-            print(f"mnn_result type: {type(mnn_result)}")
             mnn_output = np.array(mnn_result[0].read())
-
-            print(f"MNN output shape: {mnn_output.shape}")
 
             # Compare MNN with PyTorch
             max_diff_mnn_pt = np.max(np.abs(torch_numpy - mnn_output.astype(np.float32)))
