@@ -202,11 +202,22 @@ class T2SModel(nn.Module):
         )
         simplify_onnx_model(f"onnx/{project_name}/{project_name}_t2s_sdec.onnx")
 
+def load_sovits_new(sovits_path):
+    from io import BytesIO
+    f = open(sovits_path, "rb")
+    meta = f.read(2)
+    if meta != b"PK":
+        data = b"PK" + f.read()
+        bio = BytesIO()
+        bio.write(data)
+        bio.seek(0)
+        return torch.load(bio, map_location="cpu", weights_only=False)
+    return torch.load(sovits_path, map_location="cpu", weights_only=False)
 
 class VitsV1V2Model(nn.Module):
     def __init__(self, vits_path, version:str = 'v2'):
         super().__init__()
-        dict_s2 = torch.load(vits_path, map_location="cpu", weights_only=False)
+        dict_s2 = load_sovits_new(vits_path)
         self.hps = dict_s2["config"]
         if dict_s2["weight"]["enc_p.text_embedding.weight"].shape[0] == 322:
             self.hps["model"]["version"] = "v1"
