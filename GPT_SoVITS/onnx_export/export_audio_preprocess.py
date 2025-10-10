@@ -9,7 +9,6 @@ import numpy as np
 import onnxruntime as ort
 import subprocess
 import argparse
-from GPT_SoVITS.module.mel_processing import mel_spectrogram_torch
 import onnx
 import onnxsim
 
@@ -18,8 +17,6 @@ import onnxsim
 TEST_AUDIO_URL = "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/4.flac"
 SAMPLE_RATE = 32000
 MAX_AUDIO_LENGTH = 160000  # 5 seconds at 32kHz
-spec_min = -12
-spec_max = 2
 
 
 def download_audio_from_url(url):
@@ -58,41 +55,6 @@ def load_and_preprocess_audio(audio_path):
     return waveform  # Return full precision
 
 
-def norm_spec(x):
-    return (x - spec_min) / (spec_max - spec_min) * 2 - 1
-
-def denorm_spec(x):
-    spec_min = -12
-    spec_max = 2
-    return (x + 1) / 2 * (spec_max - spec_min) + spec_min
-
-mel_fn_v3 = lambda x: mel_spectrogram_torch(
-    x,
-    **{
-        "n_fft": 1024,
-        "win_size": 1024,
-        "hop_size": 256,
-        "num_mels": 100,
-        "sampling_rate": 24000,
-        "fmin": 0,
-        "fmax": None,
-        "center": False,
-    },
-)
-mel_fn_v4 = lambda x: mel_spectrogram_torch(
-    x,
-    **{
-        "n_fft": 1280,
-        "win_size": 1280,
-        "hop_size": 320,
-        "num_mels": 100,
-        "sampling_rate": 32000,
-        "fmin": 0,
-        "fmax": None,
-        "center": False,
-    },
-)
-
 def resample_audio(audio: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
     """
     Resample audio from orig_sr to target_sr using linear interpolation.
@@ -113,7 +75,7 @@ def resample_audio(audio: torch.Tensor, orig_sr: int, target_sr: int) -> torch.T
     resampled = resampled.squeeze(0).squeeze(0)
     return resampled
 
-def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
+def spectrogram_torch(y, n_fft, hop_size, win_size, center=False):
     hann_window = torch.hann_window(win_size).to(dtype=y.dtype, device=y.device)
     y = torch.nn.functional.pad(
         y.unsqueeze(1),
@@ -155,7 +117,6 @@ class AudioPreprocess(nn.Module):
         spectrum = spectrogram_torch(
             ref_audio_32k,
             2048,
-            32000,
             640,
             2048,
             center=False,
@@ -170,9 +131,7 @@ class AudioPreprocess(nn.Module):
         ref_audio_16k = torch.cat([ref_audio_16k, zero_tensor], dim=1)
         ssl_content = self.model(ref_audio_16k)["last_hidden_state"].transpose(1, 2)
 
-        mel2_v4 = mel_fn_v4(ref_audio_32k)
-        mel2_v4 = norm_spec(mel2_v4)
-        return ssl_content, spectrum, sv_emb, mel2_v4
+        return ssl_content, spectrum, sv_emb
 
 
 def export_audio_preprocess_to_onnx(
@@ -207,12 +166,11 @@ def export_audio_preprocess_to_onnx(
         opset_version=17,
         do_constant_folding=True,
         input_names=['audio32k'],
-        output_names=['hubert_ssl_output', 'spectrum', 'sv_emb', 'mel2_v4'],
+        output_names=['hubert_ssl_output', 'spectrum', 'sv_emb'],
         dynamic_axes={
             'audio32k': {1: 'sequence_length'},
             'hubert_ssl_output': {2: 'hubert_length'},
-            'spectrum': {2: 'spectrum_length'},
-            'mel2_v4': {2: 'mel2_length'}
+            'spectrum': {2: 'spectrum_length'}
         }
     )
     model, _ = onnxsim.simplify(onnx_path)
@@ -259,7 +217,7 @@ def test_model_equivalence(original_model, onnx_path: str, mnn_path: str = None,
     original_model.eval()
     with torch.no_grad():
         torch_outputs = original_model(waveform)
-        torch_ssl_content, torch_spectrum, torch_sv_emb, torch_mel2_v4 = torch_outputs
+        torch_ssl_content, torch_spectrum, torch_sv_emb = torch_outputs
 
     # Get ONNX output
     print("Running ONNX inference...")
@@ -267,7 +225,7 @@ def test_model_equivalence(original_model, onnx_path: str, mnn_path: str = None,
     input_values = waveform.numpy()
     ort_inputs = {ort_session.get_inputs()[0].name: input_values}
     ort_outputs = ort_session.run(None, ort_inputs)
-    onnx_ssl_content, onnx_spectrum, onnx_sv_emb, onnx_mel2_v4 = ort_outputs
+    onnx_ssl_content, onnx_spectrum, onnx_sv_emb = ort_outputs
 
     # Compare outputs (convert to float32 for comparison)
     print("\nComparing PyTorch and ONNX outputs:")
@@ -296,17 +254,9 @@ def test_model_equivalence(original_model, onnx_path: str, mnn_path: str = None,
     print(f"SV Embedding - Mean diff: {sv_mean_diff:.6f}, Max diff: {sv_max_diff:.6f}")
     print(f"PyTorch SV shape: {torch_sv_float.shape}, ONNX SV shape: {onnx_sv_float.shape}")
 
-    # Mel2_v4 comparison
-    torch_mel_float = torch_mel2_v4.numpy()
-    onnx_mel_float = onnx_mel2_v4
-    mel_mean_diff = np.abs(torch_mel_float - onnx_mel_float).mean()
-    mel_max_diff = np.abs(torch_mel_float - onnx_mel_float).max()
-    print(f"Mel2_v4 - Mean diff: {mel_mean_diff:.6f}, Max diff: {mel_max_diff:.6f}")
-    print(f"PyTorch Mel shape: {torch_mel_float.shape}, ONNX Mel shape: {onnx_mel_float.shape}")
-
     # Overall success check (using tighter tolerance for full precision)
     onnx_success = (ssl_mean_diff < 1e-4 and spec_mean_diff < 1e-4 and
-                    sv_mean_diff < 1e-4 and mel_mean_diff < 1e-3)
+                    sv_mean_diff < 1e-4)
 
     if onnx_success:
         print("✅ PyTorch and ONNX models are numerically equivalent!")
@@ -329,7 +279,7 @@ def test_model_equivalence(original_model, onnx_path: str, mnn_path: str = None,
             audio_preprocess_mnn = MNN.nn.load_module_from_file(
                 mnn_path,
                 ['audio32k'],
-                ['hubert_ssl_output', 'spectrum', 'sv_emb', 'mel2_v4'],
+                ['hubert_ssl_output', 'spectrum', 'sv_emb'],
                 runtime_manager=mnn_rt
             )
 
@@ -340,12 +290,10 @@ def test_model_equivalence(original_model, onnx_path: str, mnn_path: str = None,
             mnn_ssl_content = np.array(mnn_outputs[0].read())
             mnn_spectrum = np.array(mnn_outputs[1].read())
             mnn_sv_emb = np.array(mnn_outputs[2].read())
-            mnn_mel2_v4 = np.array(mnn_outputs[3].read())
 
             print(f"MNN SSL shape: {mnn_ssl_content.shape}")
             print(f"MNN Spectrum shape: {mnn_spectrum.shape}")
             print(f"MNN SV shape: {mnn_sv_emb.shape}")
-            print(f"MNN Mel shape: {mnn_mel2_v4.shape}")
 
             # Compare MNN with PyTorch
             print("\nComparing PyTorch and MNN outputs:")
@@ -365,14 +313,9 @@ def test_model_equivalence(original_model, onnx_path: str, mnn_path: str = None,
             sv_max_diff_mnn = np.abs(torch_sv_float - mnn_sv_emb).max()
             print(f"SV Embedding - Mean diff: {sv_mean_diff_mnn:.6f}, Max diff: {sv_max_diff_mnn:.6f}")
 
-            # Mel2_v4 comparison
-            mel_mean_diff_mnn = np.abs(torch_mel_float - mnn_mel2_v4).mean()
-            mel_max_diff_mnn = np.abs(torch_mel_float - mnn_mel2_v4).max()
-            print(f"Mel2_v4 - Mean diff: {mel_mean_diff_mnn:.6f}, Max diff: {mel_max_diff_mnn:.6f}")
-
             # Check MNN equivalence (using higher tolerance for quantized MNN)
             mnn_success = (ssl_mean_diff_mnn < 1e-2 and spec_mean_diff_mnn < 1e-2 and
-                          sv_mean_diff_mnn < 5e-2 and mel_mean_diff_mnn < 1e-2)
+                          sv_mean_diff_mnn < 5e-2)
 
             if mnn_success:
                 print("✅ MNN and PyTorch models are numerically equivalent!")
