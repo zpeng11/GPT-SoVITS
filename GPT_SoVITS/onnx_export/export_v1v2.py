@@ -11,6 +11,8 @@ from onnxruntime.quantization.preprocess import quant_pre_process
 from onnxsim import simplify
 import numpy as np
 import shutil,zipfile,tempfile
+from onnxconverter_common.float16 import convert_float_to_float16
+from onnxruntime.quantization.quantize import quantize_dynamic, QuantType
 
 # Add paths for imports
 sys.path.append(os.path.dirname(__file__))
@@ -28,17 +30,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def make_archive_with_compression_at_tmp(base_name, format, root_dir, compression_level=9):
+def make_archive_with_compression(zip_filepath, root_dir, compression_level=9):
     """
     Custom archive function that supports compression level
     """
-    if format != 'zip':
-        # Fall back to shutil for non-zip formats
-        return shutil.make_archive(base_name, format, root_dir)
-    temp_dir = tempfile.gettempdir()
-    zip_filename = os.path.join(temp_dir, base_name + '.zip')
-
-    with zipfile.ZipFile(zip_filename, 'w', 
+    with zipfile.ZipFile(zip_filepath, 'w', 
                         compression=zipfile.ZIP_DEFLATED,
                         compresslevel=compression_level) as zipf:
         
@@ -47,21 +43,6 @@ def make_archive_with_compression_at_tmp(base_name, format, root_dir, compressio
                 file_path = os.path.join(root, file)
                 arcname = os.path.relpath(file_path, root_dir)
                 zipf.write(file_path, arcname)
-    return zip_filename
-
-def _create_output_directories(output_dir: str) -> tuple:
-    """Create output directories for SoVITS and T2S models"""
-    sovits_output_dir = os.path.join(output_dir, "sovits")
-    t2s_output_dir = os.path.join(output_dir, "t2s")
-
-    os.makedirs(sovits_output_dir, exist_ok=True)
-    os.makedirs(t2s_output_dir, exist_ok=True)
-
-    logger.info(f"Created output directories:")
-    logger.info(f"  - SoVITS: {sovits_output_dir}")
-    logger.info(f"  - T2S: {t2s_output_dir}")
-
-    return sovits_output_dir, t2s_output_dir
 
 def export_complete_v1v2_pipeline(
     sovits_path: str,
@@ -87,8 +68,11 @@ def export_complete_v1v2_pipeline(
 
     logger.info("🚀 Starting complete v1v2 export pipeline...")
 
+    tmp_dir = tempfile.mkdtemp(prefix=f"export_{project_name}_")
+    logger.info(f"Temporary working directory: {tmp_dir}")
     # Create output directories
-    sovits_output_dir, t2s_output_dir = _create_output_directories(output_dir)
+    sovits_output_dir = os.path.join(tmp_dir, "sovits")
+    t2s_output_dir = os.path.join(tmp_dir, "t2s")
 
     # Step 1: Export SoVITS v1v2 model
     logger.info("=> Step 1: Exporting SoVITS v1v2 model...")
@@ -105,7 +89,6 @@ def export_complete_v1v2_pipeline(
             logger.info(f"   - Removed ONNX file: {onnx_path}")
 
         logger.info(f"✅ SoVITS v1v2 export completed successfully")
-        logger.info(f"   - ONNX model: {onnx_path}")
         if mnn_path:
             logger.info(f"   - MNN model: {mnn_path}")
 
@@ -182,31 +165,28 @@ def export_complete_v1v2_pipeline(
     # Step 4: Optional quantization
     if not quantize:
         logger.info("=> Skipping quantization as per user request")
-        def get_command(component_name: str):
-            return [
+        mnn_command = [
                 "mnnconvert",
                 "--f", "ONNX",
-                "--modelFile", f"{t2s_output_dir}/{component_name}.onnx",
+                "--modelFile", f"{t2s_output_dir}/t2s_fsdec.onnx",
                 "--optimizeLevel", "2",
                 "--optimizePrefer", "2",
-                "--MNNModel", f"{t2s_output_dir}/{component_name}.mnn",
+                "--MNNModel", f"{t2s_output_dir}/t2s_fsdec.mnn",
                 "--weightQuantBits", "8",
-                "--weightQuantBlock", "128"
+                "--weightQuantBlock", "32"
             ]
         try:
-            subprocess.run(get_command("t2s_fsdec"), check=True, capture_output=True, text=True)
-            print(f"Successfully exported to MNN: {t2s_output_dir}/t2s_fsdec.mnn")
-            subprocess.run(get_command("t2s_sdec"), check=True, capture_output=True, text=True)
-            print(f"Successfully exported to MNN: {t2s_output_dir}/t2s_sdec.mnn")
+            subprocess.run(mnn_command, check=True, capture_output=True, text=True)
+            logger.info(f"Successfully exported to MNN: {t2s_output_dir}/t2s_fsdec.mnn")
         except subprocess.CalledProcessError as e:
-            print(f"Error exporting to MNN: {e}")
-            print(f"stdout: {e.stdout}")
-            print(f"stderr: {e.stderr}")
+            logger.info(f"Error exporting to MNN: {e}")
+            logger.info(f"stdout: {e.stdout}")
+            logger.info(f"stderr: {e.stderr}")
+        sdec = onnx.load(f"{t2s_output_dir}/t2s_sdec.onnx")
+        sdec_fp16 = convert_float_to_float16(sdec, keep_io_types=False)
+        quantize_dynamic(sdec_fp16, f"{t2s_output_dir}/t2s_sdec.onnx", weight_type=QuantType.QInt8, op_types_to_quantize=['MatMul', 'Attention', 'Conv', 'Gemm'])
         os.remove(f"{t2s_output_dir}/t2s_fsdec.onnx")
-        os.remove(f"{t2s_output_dir}/t2s_sdec.onnx")
 
-        bsdiff4.file_diff(f"{t2s_output_dir}/t2s_sdec.mnn", f"{t2s_output_dir}/t2s_fsdec.mnn", f"{t2s_output_dir}/t2s_fsdec.diff4")
-        os.remove(f"{t2s_output_dir}/t2s_fsdec.mnn")
         logger.info("=> Export pipeline completed without quantization")
     else:
         logger.info("=> Step 4: Quantizing models for mobile inference...")
@@ -235,10 +215,10 @@ def export_complete_v1v2_pipeline(
         "vits_weights_path": sovits_path,
         "quantized": quantize,
     }
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(tmp_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(configJson, f, ensure_ascii=False, indent=4)
 
-    ref_dir = os.path.join(output_dir, "reference")
+    ref_dir = os.path.join(tmp_dir, "reference")
     os.makedirs(ref_dir, exist_ok=True)
 
     audio_ssl_feature, spectrum, sv_emb = audio_preprocess(ref_voice)
@@ -251,24 +231,11 @@ def export_complete_v1v2_pipeline(
     np.save(os.path.join(ref_dir, "ref_text_bert.npy"), ref_text_bert)
 
     logger.info("=> Step 6: Compress the output directory...")
-    tmp_zip = make_archive_with_compression_at_tmp(
-        base_name=project_name,
-        format='zip',
-        root_dir=output_dir,
+    make_archive_with_compression(
+        zip_filepath=os.path.join(output_dir, project_name+".gsv"),
+        root_dir=tmp_dir,
         compression_level=9
     )
-    # Remove with error handling for read-only files
-    def remove_readonly(func, path, _):
-        """Clear the readonly bit and reattempt the removal"""
-        os.chmod(path, os.stat.S_IWRITE)
-        func(path)
-
-    shutil.rmtree(os.path.join(output_dir, 'reference'), onerror=remove_readonly)
-    shutil.rmtree(os.path.join(output_dir, 't2s'), onerror=remove_readonly)
-    shutil.rmtree(os.path.join(output_dir, 'sovits'), onerror=remove_readonly)
-    os.remove(os.path.join(output_dir, 'config.json'))
-
-    shutil.move(tmp_zip, os.path.join(output_dir, os.path.splitext(os.path.basename(tmp_zip))[0]+'.gsv'))
 
 
 
@@ -333,7 +300,7 @@ def main():
     parser.add_argument(
         "--project_name",
         type=str,
-        default=None,
+        required=True,
         help="Name of the project"
     )
 

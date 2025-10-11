@@ -12,6 +12,7 @@ onnxruntime-gpu; platform_machine == "x86_64" or platform_machine == "AMD64"
 onnx
 onnxsim
 bsdiff4
+onnxconverter_common
 MNN
 tqdm
 funasr==1.0.27
