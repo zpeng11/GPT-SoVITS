@@ -51,6 +51,7 @@ class ExportConfig:
         self.output_dir = output_dir
         self.version = version
         self.quantize = quantize
+        self.is_v2p = version.lower() in ['v2pro', 'v2proplus']
 
     def validate(self) -> bool:
         """Validate configuration parameters"""
@@ -344,7 +345,8 @@ def create_reference_files(config: ExportConfig, tmp_dir: str) -> None:
     audio_ssl_feature, spectrum, sv_emb = audio_preprocess(config.ref_voice)
     np.save(os.path.join(ref_dir, "ref_ssl_content.npy"), audio_ssl_feature)
     np.save(os.path.join(ref_dir, "ref_spectrum.npy"), spectrum)
-    np.save(os.path.join(ref_dir, "ref_sv_emb.npy"), sv_emb)
+    if config.is_v2p:
+        np.save(os.path.join(ref_dir, "ref_sv_emb.npy"), sv_emb)
 
     # Process text reference
     ref_text_seq, ref_text_bert = preprocess_text(config.ref_text)

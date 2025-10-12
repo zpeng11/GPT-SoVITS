@@ -33,10 +33,10 @@ class MNNInferenceSession:
                 raise ValueError(f"Input name {name} not found in model inputs.")
             input_tensor = self.inputs[name]
             self.interpreter.resizeTensor(input_tensor, data.shape)
+        self.interpreter.resizeSession(self.session)
         for name in output_name_list:
             if name not in self.outputs:
                 raise ValueError(f"Output name {name} not found in model outputs.")
-        self.interpreter.resizeSession(self.session)
         for name, data in input_dict.items():
             if data.dtype == np.int64:
                 data = data.astype(np.int32)
@@ -83,6 +83,7 @@ class GSVRuntime:
         temp_dir = tempfile.mkdtemp(prefix=f"gsv_{base_name}_")
         shutil.unpack_archive(model_path, temp_dir, "zip")
         self.config: dict = json.load(open(os.path.join(temp_dir, "config.json"), "r", encoding="utf-8"))
+        self.is_v2pro = self.config['version'].lower() in ['v2pro', 'v2proplus']
         print(f"Loading project: {self.config['project_name']}")
         self.sovits: MNNInferenceSession = MNNInferenceSession(os.path.join(temp_dir, 'sovits', 'sovits_v1v2.mnn'))
         self.t2s_fsdec: MNNInferenceSession | ort.InferenceSession = None
@@ -100,7 +101,8 @@ class GSVRuntime:
             self.t2s_sdec = ort.InferenceSession(os.path.join(temp_dir, 't2s', 't2s_sdec.onnx'))
         self.ref_text_seq = np.load(os.path.join(temp_dir, "reference", "ref_text_seq.npy"))
         self.ref_text_bert = np.load(os.path.join(temp_dir, "reference", "ref_text_bert.npy"))
-        self.ref_sv_emb = np.load(os.path.join(temp_dir, "reference", "ref_sv_emb.npy"))
+        if self.is_v2pro:
+            self.ref_sv_emb = np.load(os.path.join(temp_dir, "reference", "ref_sv_emb.npy"))
         self.ref_ssl_content = np.load(os.path.join(temp_dir, "reference", "ref_ssl_content.npy"))
         self.ref_spectrum = np.load(os.path.join(temp_dir, "reference", "ref_spectrum.npy"))
         print("Model and reference data loaded successfully.")
@@ -156,8 +158,9 @@ class GSVRuntime:
             'input_text_phones': phones.astype(np.int32),
             'pred_semantic': pred_semantic.astype(np.int32),
             'spectrum': self.ref_spectrum.astype(np.float32),
-            'sv_emb': self.ref_sv_emb.astype(np.float32),
         }
+        if self.is_v2pro:
+            sovits_input['sv_emb'] = self.ref_sv_emb.astype(np.float32)
         sovits_output_names = ['audio32k']
         audio32k, = self.sovits.run(sovits_output_names, sovits_input)
         return audio32k
@@ -166,7 +169,7 @@ class GSVRuntime:
 
 
 if __name__ == "__main__":
-    rt = GSVRuntime('/home/eleven/GPT-SoVITS-export/onnx/sakiko_v2pp_quant.gsv')
+    rt = GSVRuntime('/home/eleven/GPT-SoVITS-export/onnx/seia_v2pp.gsv')
     audio = rt.infer("やがて来る世界を見渡せば、必ず赤い旗の世界となるだろう。")
     audio_postprocess([audio], 'onnx/output.wav')
 
