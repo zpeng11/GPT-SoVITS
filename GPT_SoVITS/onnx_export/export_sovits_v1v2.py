@@ -1,19 +1,47 @@
-import torch
-import torch.nn as nn
-from io import BytesIO
-import sys, os
+import argparse
+import logging
+import os
+import subprocess
+import sys
 from contextlib import contextmanager
+from io import BytesIO
+from typing import Optional, Tuple
+from io import BytesIO
 import numpy as np
 import onnx
 import onnxruntime as ort
 import onnxsim
-import subprocess
-import argparse
+import torch
+import torch.nn as nn
+
+logging.basicConfig(level=logging.INFO)
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_MNN_OPTIMIZE_LEVEL = "2"
+DEFAULT_MNN_OPTIMIZE_PREFER = "2"
+DEFAULT_MNN_WEIGHT_BITS = "8"
+DEFAULT_MNN_WEIGHT_BLOCK = "32"
+DEFAULT_TEXT_LENGTH = 20
+DEFAULT_PRED_LENGTH = 30
+DEFAULT_SPECTRUM_LENGTH = 30
+DEFAULT_TEXT_VOCAB_SIZE = 100
+DEFAULT_SEMANTIC_VOCAB_SIZE = 100
+SPECTRUM_SIZE = 1025
+SV_EMB_SIZE = 20480
 
 @contextmanager
-def temp_sys_path(path):
+def temp_sys_path(path: str):
+    """
+    Context manager for temporarily adding a path to sys.path with highest priority
+
+    Args:
+        path: Path to temporarily add to sys.path
+    """
     old_sys_path = list(sys.path)
-    sys.path.insert(0, path)  # insert(0, ...) 保证优先级最高
+    sys.path.insert(0, path)  # insert(0, ...) ensures highest priority
     try:
         yield
     finally:
@@ -31,7 +59,20 @@ def load_sovits_new(sovits_path):
     return torch.load(sovits_path, map_location="cpu", weights_only=False)
 
 class DictToAttrRecursive(dict):
-    def __init__(self, input_dict):
+    """
+    Dictionary subclass that provides attribute access to dictionary items recursively
+
+    This class allows accessing nested dictionary items as attributes, making
+    the code more readable when working with configuration dictionaries.
+    """
+
+    def __init__(self, input_dict: dict):
+        """
+        Initialize recursive attribute dictionary
+
+        Args:
+            input_dict: Dictionary to convert to attribute-accessible format
+        """
         super().__init__(input_dict)
         for key, value in input_dict.items():
             if isinstance(value, dict):
@@ -39,64 +80,276 @@ class DictToAttrRecursive(dict):
             self[key] = value
             setattr(self, key, value)
 
-    def __getattr__(self, item):
+    def __getattr__(self, item: str):
+        """
+        Get dictionary item as attribute
+
+        Args:
+            item: Key to retrieve
+
+        Returns:
+            Value associated with the key
+
+        Raises:
+            AttributeError: If key is not found
+        """
         try:
             return self[item]
         except KeyError:
             raise AttributeError(f"Attribute {item} not found")
 
-    def __setattr__(self, key, value):
+    def __setattr__(self, key: str, value):
+        """
+        Set dictionary item as attribute
+
+        Args:
+            key: Key to set
+            value: Value to associate with key
+        """
         if isinstance(value, dict):
             value = DictToAttrRecursive(value)
         super(DictToAttrRecursive, self).__setitem__(key, value)
         super().__setattr__(key, value)
 
-    def __delattr__(self, item):
+    def __delattr__(self, item: str):
+        """
+        Delete dictionary item as attribute
+
+        Args:
+            item: Key to delete
+
+        Raises:
+            AttributeError: If key is not found
+        """
         try:
             del self[item]
         except KeyError:
             raise AttributeError(f"Attribute {item} not found")
 
 class VitsV1V2Model(nn.Module):
-    def __init__(self, vits_path, version:str = 'v2'):
+    """
+    SoVITS v1/v2/v2Pro/v2ProPlus model wrapper for ONNX export
+
+    This class wraps the SoVITS model and provides a unified interface
+    for different model versions while preparing them for ONNX export.
+    """
+
+    def __init__(self, vits_path: str, version: str = 'v2'):
+        """
+        Initialize SoVITS model wrapper
+
+        Args:
+            vits_path: Path to the SoVITS model file
+            version: Model version ('v1', 'v2', 'v2Pro', 'v2ProPlus')
+        """
         super().__init__()
+
+        # Load model data
         dict_s2 = load_sovits_new(vits_path)
         self.hps = dict_s2["config"]
+
+        # Auto-detect version based on text embedding size
         if dict_s2["weight"]["enc_p.text_embedding.weight"].shape[0] == 322:
             self.hps["model"]["version"] = "v1"
+            logger.info("Auto-detected model version: v1")
         else:
             self.hps["model"]["version"] = version
+            logger.info(f"Using specified model version: {version}")
 
+        # Check if this is a v2Pro model
         self.is_v2p = version.lower() in ['v2pro', 'v2proplus']
+        if self.is_v2p:
+            logger.info("Initializing v2Pro model with speaker embedding support")
 
+        # Convert configuration to attribute-accessible format
         self.hps = DictToAttrRecursive(self.hps)
         self.hps.model.semantic_frame_rate = "25hz"
-        with temp_sys_path(os.path.join(os.path.dirname(__file__), '..' )):
+
+        # Load the synthesizer model
+        self._load_synthesizer_model(dict_s2["weight"])
+
+    def _load_synthesizer_model(self, weights: dict) -> None:
+        """
+        Load the synthesizer model with proper configuration
+
+        Args:
+            weights: Model weights dictionary
+        """
+        logger.info("Loading synthesizer model...")
+
+        with temp_sys_path(os.path.join(os.path.dirname(__file__), '..')):
             from module.models_onnx import SynthesizerTrn
-            self.vq_model:SynthesizerTrn = SynthesizerTrn(
+
+            self.vq_model: SynthesizerTrn = SynthesizerTrn(
                 self.hps.data.filter_length // 2 + 1,
                 self.hps.train.segment_size // self.hps.data.hop_length,
                 n_speakers=self.hps.data.n_speakers,
                 **self.hps.model,
             )
+
         self.vq_model.eval()
-        self.vq_model.load_state_dict(dict_s2["weight"], strict=False)
-        # self.vq_model.half()
-        # print(f"filter_length:{self.hps.data.filter_length} sampling_rate:{self.hps.data.sampling_rate} hop_length:{self.hps.data.hop_length} win_length:{self.hps.data.win_length}")
-        #v2 filter_length: 2048 sampling_rate: 32000 hop_length: 640 win_length: 2048
-    def forward(self, text_seq, pred_semantic, spectrum, sv_emb):
+        self.vq_model.load_state_dict(weights, strict=False)
+
+        logger.info(f"Model configuration - filter_length: {self.hps.data.filter_length}, "
+                   f"sampling_rate: {self.hps.data.sampling_rate}, "
+                   f"hop_length: {self.hps.data.hop_length}, "
+                   f"win_length: {self.hps.data.win_length}")
+
+    def forward(self, text_seq: torch.Tensor, pred_semantic: torch.Tensor,
+                spectrum: torch.Tensor, sv_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass through the SoVITS model
+
+        Args:
+            text_seq: Text sequence tensor
+            pred_semantic: Predicted semantic tensor
+            spectrum: Spectrogram tensor
+            sv_emb: Speaker embedding tensor (required for v2Pro models)
+
+        Returns:
+            Generated audio tensor
+        """
         if self.is_v2p:
+            if sv_emb is None:
+                raise ValueError("Speaker embedding (sv_emb) is required for v2Pro models")
             return self.vq_model(pred_semantic, text_seq, spectrum, sv_emb=sv_emb)[0, 0]
         else:
             return self.vq_model(pred_semantic, text_seq, spectrum)[0, 0]
-        
+
+
+def create_dummy_inputs() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create dummy input tensors for ONNX export
+
+    Returns:
+        Tuple of dummy tensors (text_seq, pred_semantic, spectrum, sv_emb)
+    """
+    logger.info("Creating dummy input tensors for ONNX export")
+
+    text_seq_rand = torch.randint(0, DEFAULT_TEXT_VOCAB_SIZE, (1, DEFAULT_TEXT_LENGTH), dtype=torch.int64)
+    pred_semantic_rand = torch.randint(1, DEFAULT_SEMANTIC_VOCAB_SIZE, (1, 1, DEFAULT_PRED_LENGTH)).to(torch.int64)
+    spectrum_rand = torch.randn(1, SPECTRUM_SIZE, DEFAULT_SPECTRUM_LENGTH).to(torch.float32)
+    sv_emb_rand = torch.randn(1, SV_EMB_SIZE).to(torch.float32)
+
+    return text_seq_rand, pred_semantic_rand, spectrum_rand, sv_emb_rand
+
+
+def export_to_onnx(model: VitsV1V2Model, output_path: str,
+                   dummy_inputs: Tuple[torch.Tensor, ...]) -> None:
+    """
+    Export PyTorch model to ONNX format
+
+    Args:
+        model: PyTorch model to export
+        output_path: Path to save ONNX model
+        dummy_inputs: Dummy input tensors for tracing
+    """
+    logger.info(f"Exporting SoVITS model to ONNX: {output_path}")
+
+    torch.onnx.export(
+        model,
+        dummy_inputs,
+        output_path,
+        input_names=["input_text_phones", "pred_semantic", "spectrum", "sv_emb"],
+        output_names=["audio32k"],
+        dynamic_axes={
+            "input_text_phones": {1: "text_length"},
+            "pred_semantic": {2: "pred_length"},
+            "spectrum": {2: "spectrum_length"},
+        },
+        opset_version=17,
+        verbose=False,
+    )
+
+    logger.info(f"SoVITS model exported successfully to: {output_path}")
+
+
+def simplify_onnx_model(onnx_path: str) -> bool:
+    """
+    Simplify ONNX model to optimize performance
+
+    Args:
+        onnx_path: Path to ONNX model file
+
+    Returns:
+        True if simplification was successful, False otherwise
+    """
+    logger.info(f"Simplifying ONNX model: {onnx_path}")
+
+    try:
+        # Load the exported ONNX model
+        onnx_model = onnx.load(onnx_path)
+
+        # Simplify the model
+        simplified_model, check = onnxsim.simplify(onnx_model)
+
+        if check:
+            # Save the simplified model, replacing the original
+            onnx.save(simplified_model, onnx_path)
+            logger.info(f"ONNX model simplified and saved in-place: {onnx_path}")
+            return True
+        else:
+            logger.warning("ONNX simplification check failed, keeping original model")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error during ONNX simplification: {e}")
+        logger.warning("Keeping original ONNX model without simplification")
+        return False
+
+
+def export_to_mnn(onnx_path: str, mnn_path: str) -> Optional[str]:
+    """
+    Export ONNX model to MNN format with quantization
+
+    Args:
+        onnx_path: Path to input ONNX model
+        mnn_path: Path to save MNN model
+
+    Returns:
+        Path to MNN model if successful, None otherwise
+    """
+    logger.info(f"Exporting ONNX to MNN: {onnx_path} -> {mnn_path}")
+
+    mnn_command = [
+        "mnnconvert",
+        "--f", "ONNX",
+        "--modelFile", onnx_path,
+        "--optimizeLevel", DEFAULT_MNN_OPTIMIZE_LEVEL,
+        "--optimizePrefer", DEFAULT_MNN_OPTIMIZE_PREFER,
+        "--MNNModel", mnn_path,
+        "--weightQuantBits", DEFAULT_MNN_WEIGHT_BITS,
+        "--weightQuantBlock", DEFAULT_MNN_WEIGHT_BLOCK,
+    ]
+
+    try:
+        subprocess.run(mnn_command, check=True, capture_output=True, text=True)
+        logger.info(f"Successfully exported to MNN: {mnn_path}")
+        return mnn_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error exporting to MNN: {e}")
+        logger.error(f"stdout: {e.stdout}")
+        logger.error(f"stderr: {e.stderr}")
+        return None
+
 
 def export_sovits_v1v2_to_onnx(
     vits_path: str = "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
     output_dir: str = "onnx/sovits_v2",
     version: str = 'v2'
-):
-    """Export SoVITS v1/v2/v2p/v2pp to ONNX format"""
+) -> Tuple[VitsV1V2Model, str, Optional[str]]:
+    """
+    Export SoVITS v1/v2/v2Pro/v2ProPlus model to ONNX and MNN formats
+
+    Args:
+        vits_path: Path to the SoVITS model file
+        output_dir: Output directory for exported models
+        version: SoVITS model version
+
+    Returns:
+        Tuple of (model, onnx_path, mnn_path)
+    """
+    logger.info(f"Starting SoVITS {version} export pipeline")
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -108,175 +361,226 @@ def export_sovits_v1v2_to_onnx(
     # Load model
     model = VitsV1V2Model(vits_path, version=version)
 
-    # Create dummy input
-    text_seq_rand = torch.randint(0, 100, (1, 20), dtype=torch.int64)
-    pred_semantic_rand = torch.randint(1, 100, (1, 1, 30)).to(torch.int64)
-    spectrum_rand = torch.randn(1, 1025, 30).to(torch.float32)
-    sv_emb_rand = torch.randn(1, 20480).to(torch.float32)
+    # Create dummy inputs
+    dummy_inputs = create_dummy_inputs()
 
     # Export to ONNX
-    print(f"Exporting SoVITS v1/v2/v2p/v2pp to ONNX: {sovits_onnx_path}")
-    torch.onnx.export(
-        model,
-        (text_seq_rand, pred_semantic_rand, spectrum_rand, sv_emb_rand),
-        sovits_onnx_path,
-        input_names=["input_text_phones", "pred_semantic", "spectrum", "sv_emb"],
-        output_names=["audio32k"],
-        dynamic_axes={
-            "input_text_phones": {1: "text_length"},
-            "pred_semantic": {2: "pred_length"},
-            "spectrum": {2: "spectrum_length"},
-        },
-        opset_version=17,
-        verbose=False,
-    )
-    print(f"SoVITS v1/v2/v2p/v2pp model exported successfully to: {sovits_onnx_path}")
+    export_to_onnx(model, sovits_onnx_path, dummy_inputs)
 
-    print(f"Simplifying ONNX model: {sovits_onnx_path}")
-    try:
-        # Load the exported ONNX model
-        onnx_model = onnx.load(sovits_onnx_path)
-
-        # Simplify the model
-        simplified_model, check = onnxsim.simplify(onnx_model)
-
-        if check:
-            # Save the simplified model, replacing the original
-            onnx.save(simplified_model, sovits_onnx_path)
-            print(f"ONNX model simplified and saved in-place: {sovits_onnx_path}")
-        else:
-            print("ONNX simplification check failed, keeping original model")
-    except Exception as e:
-        print(f"Error during ONNX simplification: {e}")
-        print("Keeping original ONNX model without simplification")
+    # Simplify ONNX model
+    simplify_onnx_model(sovits_onnx_path)
 
     # Export to MNN format
-    print(f"Exporting to MNN: {sovits_mnn_path}")
-    mnn_command = [
-        "mnnconvert",
-        "--f", "ONNX",
-        "--modelFile", sovits_onnx_path,
-        "--optimizeLevel", "2",
-        "--optimizePrefer", "2",
-        "--MNNModel", sovits_mnn_path,
-        "--weightQuantBits", "8",
-        "--weightQuantBlock", "32",
-    ]
+    mnn_path = export_to_mnn(sovits_onnx_path, sovits_mnn_path)
+
+    logger.info("SoVITS export pipeline completed successfully")
+    return model, sovits_onnx_path, mnn_path
+
+
+def create_test_inputs() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create test input tensors for model validation
+
+    Returns:
+        Tuple of test tensors (text_seq, pred_semantic, spectrum, sv_emb)
+    """
+    logger.info("Creating test input tensors for model validation")
+
+    text_seq_rand = torch.randint(0, DEFAULT_TEXT_VOCAB_SIZE, (1, DEFAULT_TEXT_LENGTH), dtype=torch.int64)
+    pred_semantic_rand = torch.randint(1, DEFAULT_SEMANTIC_VOCAB_SIZE, (1, 1, DEFAULT_PRED_LENGTH)).to(torch.int64)
+    spectrum_rand = torch.randn(1, SPECTRUM_SIZE, DEFAULT_SPECTRUM_LENGTH).to(torch.float32)
+    sv_emb_rand = torch.randn(1, SV_EMB_SIZE).to(torch.float32)
+
+    return text_seq_rand, pred_semantic_rand, spectrum_rand, sv_emb_rand
+
+
+def run_pytorch_inference(model: VitsV1V2Model, inputs: Tuple[torch.Tensor, ...]) -> np.ndarray:
+    """
+    Run inference on PyTorch model
+
+    Args:
+        model: PyTorch model
+        inputs: Input tensors
+
+    Returns:
+        Model output as numpy array
+    """
+    logger.info("Running PyTorch inference...")
+    model.eval()
+    with torch.no_grad():
+        torch_output = model(*inputs)
+    return torch_output.float().numpy()
+
+
+def run_onnx_inference(onnx_path: str, inputs: Tuple[torch.Tensor, ...]) -> np.ndarray:
+    """
+    Run inference on ONNX model
+
+    Args:
+        onnx_path: Path to ONNX model
+        inputs: Input tensors
+
+    Returns:
+        Model output as numpy array
+    """
+    logger.info("Running ONNX inference...")
+    ort_session = ort.InferenceSession(onnx_path)
+
+    ort_inputs = {
+        ort_session.get_inputs()[0].name: inputs[0].numpy(),
+        ort_session.get_inputs()[1].name: inputs[1].numpy(),
+        ort_session.get_inputs()[2].name: inputs[2].numpy().astype(np.float32),
+        ort_session.get_inputs()[3].name: inputs[3].numpy().astype(np.float32),
+    }
+
+    ort_outputs = ort_session.run(None, ort_inputs)
+    return ort_outputs[0]
+
+
+def run_mnn_inference(mnn_path: str, inputs: Tuple[torch.Tensor, ...]) -> Optional[np.ndarray]:
+    """
+    Run inference on MNN model
+
+    Args:
+        mnn_path: Path to MNN model
+        inputs: Input tensors
+
+    Returns:
+        Model output as numpy array if successful, None otherwise
+    """
+    if not mnn_path or not os.path.exists(mnn_path):
+        logger.info("MNN model path not provided or file does not exist, skipping MNN test")
+        return None
+
+    logger.info("Running MNN inference...")
 
     try:
-        subprocess.run(mnn_command, check=True, capture_output=True, text=True)
-        print(f"Successfully exported to MNN: {sovits_mnn_path}")
-    except subprocess.CalledProcessError as e:
-        print(f"Error exporting to MNN: {e}")
-        print(f"stdout: {e.stdout}")
-        print(f"stderr: {e.stderr}")
-        sovits_mnn_path = None
+        import MNN
+        import MNN.numpy as mnp
 
-    return model, sovits_onnx_path, sovits_mnn_path
+        mnn_config = {
+            'backend': 'CPU',
+            'thread': 12
+        }
+        mnn_rt = MNN.nn.create_runtime_manager((mnn_config,))
+
+        sovits_mnn = MNN.nn.load_module_from_file(
+            mnn_path,
+            ["input_text_phones", "pred_semantic", "spectrum", "sv_emb"],
+            ['audio32k'],
+            runtime_manager=mnn_rt
+        )
+
+        # Prepare inputs for MNN
+        mnn_inputs = [
+            mnp.array(inputs[0].numpy().astype(np.int64)),
+            mnp.array(inputs[1].numpy().astype(np.int64)),
+            mnp.array(inputs[2].numpy().astype(np.float32)),
+            mnp.array(inputs[3].numpy().astype(np.float32))
+        ]
+
+        mnn_result = sovits_mnn(mnn_inputs)
+        mnn_output = np.array(mnn_result[0].read())
+
+        logger.info("MNN inference completed successfully")
+        return mnn_output
+
+    except Exception as e:
+        logger.error(f"❌ Error testing MNN model: {e}")
+        return None
 
 
-def test_model(original_model, onnx_path: str, mnn_path: str = None):
-    """Test if the original PyTorch model, ONNX model, and MNN model produce similar outputs"""
+def compare_outputs(torch_output: np.ndarray, onnx_output: np.ndarray,
+                    mnn_output: Optional[np.ndarray] = None) -> bool:
+    """
+    Compare outputs from different model formats
 
-    print("Testing SoVITS v1/v2/v2p/v2pp model equivalence...")
+    Args:
+        torch_output: PyTorch model output
+        onnx_output: ONNX model output
+        mnn_output: MNN model output (optional)
 
-    # Generate random input with variable dimensions
-    batch_size = 1
-    text_length = 20  # Variable text length
-    pred_length = 30  # Variable pred semantic length
-    spectrum_length = 30  # Variable spectrum length
-
-    text_seq_rand = torch.randint(0, 100, (batch_size, text_length), dtype=torch.int64)
-    pred_semantic_rand = torch.randint(1, 100, (batch_size, 1, pred_length)).to(torch.int64)
-    spectrum_rand = torch.randn(batch_size, 1025, spectrum_length).to(torch.float32)
-    sv_emb_rand = torch.randn(batch_size, 20480).to(torch.float32)
-
-    # Get PyTorch output
-    print("Running PyTorch inference...")
-    original_model.eval()
-    with torch.no_grad():
-        torch_output = original_model(text_seq_rand, pred_semantic_rand, spectrum_rand, sv_emb_rand)
-
-    # Get ONNX output
-    print("Running ONNX inference...")
-    ort_session = ort.InferenceSession(onnx_path)
-    ort_inputs = {
-        ort_session.get_inputs()[0].name: text_seq_rand.numpy(),
-        ort_session.get_inputs()[1].name: pred_semantic_rand.numpy(),
-        ort_session.get_inputs()[2].name: spectrum_rand.numpy().astype(np.float32),
-        ort_session.get_inputs()[3].name: sv_emb_rand.numpy().astype(np.float32),
-    }
-    ort_outputs = ort_session.run(None, ort_inputs)
-    onnx_output = ort_outputs[0]
-
-    # Compare outputs (convert to float32 for comparison)
-    torch_numpy = torch_output.float().numpy()
+    Returns:
+        True if outputs are similar enough, False otherwise
+    """
+    # Convert to float32 for comparison
     onnx_float32 = onnx_output.astype(np.float32)
-    mean_diff = np.abs(torch_numpy - onnx_float32).mean()
-    max_diff = np.abs(torch_numpy - onnx_float32).max()
 
-    print(f"PyTorch output shape: {torch_numpy.shape}")
-    print(f"ONNX output shape: {onnx_output.shape}")
-    print(f"Mean absolute difference: {mean_diff:.6f}")
-    print(f"Max absolute difference: {max_diff:.6f}")
+    # Compare PyTorch and ONNX outputs
+    mean_diff_onnx = np.abs(torch_output - onnx_float32).mean()
+    max_diff_onnx = np.abs(torch_output - onnx_float32).max()
 
-    # Test MNN model if path is provided
-    if mnn_path and os.path.exists(mnn_path):
-        print("Testing MNN model...")
-        try:
-            import MNN
-            import MNN.numpy as mnp
+    logger.info(f"PyTorch output shape: {torch_output.shape}")
+    logger.info(f"ONNX output shape: {onnx_output.shape}")
+    logger.info(f"PyTorch vs ONNX - Mean absolute difference: {mean_diff_onnx:.6f}")
+    logger.info(f"PyTorch vs ONNX - Max absolute difference: {max_diff_onnx:.6f}")
 
-            mnn_config = {}
-            mnn_config['backend'] = 'CPU'
-            mnn_config['thread'] = 12
-            mnn_rt = MNN.nn.create_runtime_manager((mnn_config,))
+    # Check if MNN output is available and compare
+    if mnn_output is not None:
+        mean_diff_mnn = np.abs(torch_output - mnn_output.astype(np.float32)).mean()
+        max_diff_mnn = np.abs(torch_output - mnn_output.astype(np.float32)).max()
 
-            sovits_mnn = MNN.nn.load_module_from_file(
-                mnn_path,
-                ["input_text_phones", "pred_semantic", "spectrum", "sv_emb"],
-                ['audio32k'],
-                runtime_manager=mnn_rt
-            )
+        logger.info(f"MNN vs PyTorch - Mean absolute difference: {mean_diff_mnn:.6f}")
+        logger.info(f"MNN vs PyTorch - Max absolute difference: {max_diff_mnn:.6f}")
 
-            # Prepare inputs for MNN (convert to float32 for MNN)
-            mnn_inputs = [
-                mnp.array(text_seq_rand.numpy().astype(np.int64)),
-                mnp.array(pred_semantic_rand.numpy().astype(np.int64)),
-                mnp.array(spectrum_rand.numpy().astype(np.float32)),
-                mnp.array(sv_emb_rand.numpy().astype(np.float32))
-            ]
+    # Define success criteria
+    onnx_success = mean_diff_onnx < 1e-2 and max_diff_onnx < 5e-2
+    mnn_success = mnn_output is None or (mean_diff_mnn < 1e-2 and max_diff_mnn < 5e-2)
 
-            mnn_result = sovits_mnn(mnn_inputs)
-            mnn_output = np.array(mnn_result[0].read())
-
-            # Compare MNN with PyTorch
-            max_diff_mnn_pt = np.max(np.abs(torch_numpy - mnn_output.astype(np.float32)))
-            mean_diff_mnn_pt = np.mean(np.abs(torch_numpy - mnn_output.astype(np.float32)))
-
-            print(f"MNN vs PyTorch - Maximum absolute difference: {max_diff_mnn_pt:.6f}")
-            print(f"MNN vs PyTorch - Mean absolute difference: {mean_diff_mnn_pt:.6f}")
+    return onnx_success and mnn_success
 
 
-        except Exception as e:
-            print(f"❌ Error testing MNN model: {e}")
+def test_model(original_model: VitsV1V2Model, onnx_path: str,
+              mnn_path: Optional[str] = None) -> bool:
+    """
+    Test if the original PyTorch model, ONNX model, and MNN model produce similar outputs
+
+    Args:
+        original_model: Original PyTorch model
+        onnx_path: Path to ONNX model
+        mnn_path: Path to MNN model (optional)
+
+    Returns:
+        True if all models produce similar outputs, False otherwise
+    """
+    logger.info("Testing SoVITS model equivalence across different formats...")
+
+    # Create test inputs
+    test_inputs = create_test_inputs()
+
+    # Run inference on all models
+    torch_output = run_pytorch_inference(original_model, test_inputs)
+    onnx_output = run_onnx_inference(onnx_path, test_inputs)
+    mnn_output = run_mnn_inference(mnn_path, test_inputs)
+
+    # Compare outputs
+    success = compare_outputs(torch_output, onnx_output, mnn_output)
+
+    if success:
+        logger.info("✅ All models produce equivalent outputs!")
     else:
-        print("MNN model path not provided or file does not exist, skipping MNN test")
+        logger.warning("⚠️  Some models have significant differences in outputs")
 
-    return True
+    return success
 
 
-def main():
-    """Main execution function"""
+def main() -> int:
+    """
+    Main execution function
+
+    Returns:
+        Exit code (0 for success, 1 for failure)
+    """
     parser = argparse.ArgumentParser(
-        description="Export SoVITS v1/v2/v2p/v2pp model to ONNX format with automatic testing",
+        description="Export SoVITS v1/v2/v2Pro/v2ProPlus model to ONNX format with automatic testing",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+
     parser.add_argument(
         "--vits_path",
         type=str,
         default="GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
-        help="Path to the SoVITS v1/v2/v2p/v2pp model file"
+        help="Path to the SoVITS model file"
     )
     parser.add_argument(
         "--output_dir",
@@ -291,23 +595,18 @@ def main():
         choices=["v1", "v2", "v2Pro", "v2ProPlus"],
         help="SoVITS model version"
     )
-    parser.add_argument(
-        "--num_tests",
-        type=int,
-        default=1,
-        help="Number of random tests to perform for model equivalence"
-    )
     args = parser.parse_args()
 
     try:
         # Export model
+        logger.info("Starting SoVITS model export pipeline")
         original_model, onnx_path, mnn_path = export_sovits_v1v2_to_onnx(
             vits_path=args.vits_path,
             output_dir=args.output_dir,
             version=args.version
         )
 
-        # Test equivalence
+        logger.info("Running model equivalence tests")
         success = test_model(
             original_model=original_model,
             onnx_path=onnx_path,
@@ -315,14 +614,17 @@ def main():
         )
 
         if success:
-            print("\n✨ All tests passed! Your ONNX and MNN models are ready to use.")
-            return 0
+            logger.info("✅ All tests passed! Your ONNX and MNN models are ready to use.")
         else:
-            print("\n⚠️  Some tests failed. Please check the outputs above.")
+            logger.warning("⚠️  Some tests failed. Please check the outputs above.")
             return 1
+        return 0
 
+    except KeyboardInterrupt:
+        logger.info("❌ Export pipeline interrupted by user")
+        return 1
     except Exception as e:
-        print(f"\n❌ Error during export: {e}")
+        logger.error(f"❌ Error during export: {e}")
         return 1
 
 
