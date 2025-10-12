@@ -11,6 +11,8 @@ from preprocess_utils import preprocess_text, audio_preprocess
 from quantization_utils import optimize_quantize,remove_quantize_and_change_input,get_initializer,set_initializer_value,find_node_by_op_name,find_nodes_children
 import onnxruntime as ort
 import onnx
+from onnxconverter_common.float16 import convert_float_to_float16
+from onnxsim import simplify
 
 CALIB_TEXTs =[
     "今天的天气格外晴朗，阳光透过窗户洒在桌案上。",
@@ -258,6 +260,96 @@ def quantize_t2s(fsdec_path, fsdec_quant_path, sdec_path, sdec_quant_path, ref_t
     onnx.checker.check_model(fsdec)
     onnx.save(fsdec, fsdec_quant_path)
 
+def get_fp16_block_list(onnx_model:onnx.ModelProto):
+    node_block_list = [node.name for node in onnx_model.graph.node]
+    node_block_list_new = []
+    for node_name in node_block_list:
+        if '/transformer_encoder' not in node_name and node_name != '/Gather' and node_name != '/ar_predict_layer/MatMul':
+            continue
+        flag = False
+        for i in range(24):
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Add':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Slice' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Slice_1' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Slice_2':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Concat' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Concat_1':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Reshape' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Reshape_1' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Reshape_2' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Reshape_3':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Transpose_1' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Transpose_2' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Transpose_3' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Transpose_5':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Unsqueeze' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Unsqueeze_1' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Unsqueeze_2':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Mul_3' or node_name == f'/transformer_encoder/layers.{i}/self_attn/Mul_4':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/MatMul_1' or node_name == f'/transformer_encoder/layers.{i}/self_attn/MatMul_2':
+                flag = True
+                break
+            if node_name == f'/transformer_encoder/layers.{i}/self_attn/Softmax':
+                flag = True
+                break
+        if flag:
+            continue
+        node_block_list_new.append(node_name)
+    return node_block_list_new
+
+def remove_redundant_cast(onnx_model:onnx.ModelProto):
+    find_node_by_op_name(onnx_model, 'Add', '/transformer_encoder/layers.0/Add').input[0] = '/transformer_encoder/layers.0/self_attn/MatMul_input_cast_0'
+
+    for i in range(24):
+        if i != 0:
+            find_node_by_op_name(onnx_model, 'Add', f'/transformer_encoder/layers.{i}/Add').input[0] = f'/transformer_encoder/layers.{i-1}/norm2/LayerNormalization_output_cast_0'
+            find_node_by_op_name(onnx_model, 'MatMul', f'/transformer_encoder/layers.{i}/self_attn/MatMul').input[0] = f'/transformer_encoder/layers.{i-1}/norm2/LayerNormalization_output_cast_0'
+        find_node_by_op_name(onnx_model, 'MatMul', f'/transformer_encoder/layers.{i}/linear1/MatMul').input[0] = f'/transformer_encoder/layers.{i}/norm1/LayerNormalization_output_cast_0'
+        find_node_by_op_name(onnx_model, 'MatMul', f'/transformer_encoder/layers.{i}/Add_1').input[0] = f'/transformer_encoder/layers.{i}/norm1/LayerNormalization_output_cast_0'
+    onnx_model, _ = simplify(onnx_model)
+    return onnx_model
+
+def convert_random_normal_like_to_fp16(model: onnx.ModelProto, node_name: str):
+    """Convert a RandomNormalLike node to output FP16"""
+    for node in model.graph.node:
+        if node.name == node_name and node.op_type == 'RandomNormalLike':
+            # Check if dtype attribute exists
+            dtype_attr_found = False
+            for attr in node.attribute:
+                if attr.name == 'dtype':
+                    attr.i = onnx.TensorProto.FLOAT16
+                    dtype_attr_found = True
+                    break
+            
+            # If no dtype attribute, add one
+            if not dtype_attr_found:
+                dtype_attr = onnx.helper.make_attribute('dtype', onnx.TensorProto.FLOAT16)
+                node.attribute.append(dtype_attr)
+            
+            print(f"Converted {node_name} to FP16 output")
+            return model
+    
+    print(f"Node {node_name} not found or not RandomNormalLike")
+    return model
+
+
+def t2s_sdec_fp16_dynamic_quant(input_model_path, output_model_path):
+    onnx_model = onnx.load(input_model_path)
+
+    node_block_list = get_fp16_block_list(onnx_model)
+    onnx_model_fp16 = convert_float_to_float16(onnx_model, keep_io_types=False, node_block_list=node_block_list)
+    onnx_model_fp16 = convert_random_normal_like_to_fp16(onnx_model_fp16, '/RandomNormalLike')
+    onnx_model_fp16 = remove_redundant_cast(onnx_model_fp16)
+
+    quantize_dynamic(onnx_model_fp16, output_model_path, 
+                     weight_type=QuantType.QInt8, 
+                     op_types_to_quantize=['MatMul', 'Attention', 'Conv', 'Gemm'], 
+                     nodes_to_exclude=['/ar_predict_layer/MatMul'],
+                     per_channel=True,
+                     reduce_range=True)
 
 if __name__ == "__main__":
     fsdec_path = 'onnx/v2pp/t2s/t2s_fsdec.onnx'

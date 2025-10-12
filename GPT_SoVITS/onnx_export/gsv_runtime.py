@@ -106,8 +106,7 @@ class GSVRuntime:
         print("Model and reference data loaded successfully.")
     def infer(self, text: str):
         phones, bert_features = preprocess_text(text, version=self.config['version'])
-        print(f"Preprocessed text to phones shape: {phones.shape}, bert features shape: {bert_features.shape}")
-        # T2S
+        # T2S fsdec
         fsdec_input = {
             'encoder_ref_seq': self.ref_text_seq,
             'encoder_ref_bert': self.ref_text_bert,
@@ -119,23 +118,24 @@ class GSVRuntime:
         if self.config["quantized"]:
             fsdec_output_names = ['y', 'y_emb'] + [f'present_k_layer_{i}_quantized' for i in range(24)] + [f'present_v_layer_{i}_quantized' for i in range(24)]
         else:
-            pass # TODO
+            fsdec_output_names = ['y', 'y_emb'] + [f'present_k_layer_{i}' for i in range(24)] + [f'present_v_layer_{i}' for i in range(24)]
         y, y_emb, *present_kv = self.t2s_fsdec.run(fsdec_output_names, fsdec_input)
-        print(f"T2S FSDec output y shape: {y.shape}, y_emb shape: {y_emb.shape}")
-        
-        sdec_input_names = []
-        if self.config["quantized"]:
-            sdec_input_names = ['iy', 'iy_emb'] + [f'past_k_layer_{i}' for i in range(24)] + [f'past_v_layer_{i}' for i in range(24)]
-        else:
-            pass # TODO
+        if not self.config["quantized"]:
+            y = y.astype(np.int64)
+            y_emb = y_emb.astype(np.float16)
+            present_kv = [kv.astype(np.float16) for kv in present_kv]
 
+        # T2S sdec
+        sdec_input_names = ['iy', 'iy_emb'] + [f'past_k_layer_{i}' for i in range(24)] + [f'past_v_layer_{i}' for i in range(24)]
         sdec_output_names = []
         if self.config["quantized"]:
             sdec_output_names = ['y', 'stop_condition_tensor', 'increased_y_emb'] + \
                                 [f'increased_k_layer_{i}_quantized' for i in range(24)] + \
                                 [f'increased_v_layer_{i}_quantized' for i in range(24)]
         else:
-            pass # TODO
+            sdec_output_names = ['y', 'stop_condition_tensor', 'increased_y_emb'] + \
+                                [f'increased_k_layer_{i}' for i in range(24)] + \
+                                [f'increased_v_layer_{i}' for i in range(24)]
 
         idx: int = 0
         for idx in tqdm(range(1000), desc="T2S SDec Inference"):
@@ -150,7 +150,6 @@ class GSVRuntime:
                 break
         y = y[:,:-1]
         pred_semantic = np.expand_dims(y[:, -idx:], axis=0)
-        print(f"Predicted semantic shape: {pred_semantic.shape}")
 
         # SoVITS
         sovits_input = {
@@ -161,14 +160,13 @@ class GSVRuntime:
         }
         sovits_output_names = ['audio32k']
         audio32k, = self.sovits.run(sovits_output_names, sovits_input)
-        print(f"Sovits output audio32k shape: {audio32k.shape}")
         return audio32k
 
 
 
 
 if __name__ == "__main__":
-    rt = GSVRuntime('/home/eleven/GPT-SoVITS-export/onnx/v2pp.gsv')
-    audio = rt.infer("空の凧は空を飛び、地上の人々は地上で追いかける。")
+    rt = GSVRuntime('/home/eleven/GPT-SoVITS-export/onnx/sakiko_v2pp_quant.gsv')
+    audio = rt.infer("やがて来る世界を見渡せば、必ず赤い旗の世界となるだろう。")
     audio_postprocess([audio], 'onnx/output.wav')
 

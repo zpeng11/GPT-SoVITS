@@ -7,7 +7,9 @@ def find_node_by_op_name(onnx_model:onnx.ModelProto, op_type:str, name:str) -> o
     Find a node in the ONNX model by its operation type and name.
     """
     for node in onnx_model.graph.node:
-        if node.op_type == op_type and node.name == name:
+        if node.op_type is not None and node.op_type == op_type and node.name == name:
+            return node
+        elif node.name == name:
             return node
     raise ValueError(f"Node with op_type {op_type} and name {name} not found.")
 

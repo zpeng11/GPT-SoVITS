@@ -11,8 +11,6 @@ from onnxruntime.quantization.preprocess import quant_pre_process
 from onnxsim import simplify
 import numpy as np
 import shutil,zipfile,tempfile
-from onnxconverter_common.float16 import convert_float_to_float16
-from onnxruntime.quantization.quantize import quantize_dynamic, QuantType
 
 # Add paths for imports
 sys.path.append(os.path.dirname(__file__))
@@ -20,7 +18,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from export_sovits_v1v2 import export_sovits_v1v2_to_onnx
 from genie_t2s_converter.Converter import convert_t2s_only
-from t2s_quantization import quantize_t2s
+from t2s_quantization import quantize_t2s, t2s_sdec_fp16_dynamic_quant
 from preprocess_utils import preprocess_text, audio_preprocess
 
 # Configure logging
@@ -169,7 +167,7 @@ def export_complete_v1v2_pipeline(
                 "mnnconvert",
                 "--f", "ONNX",
                 "--modelFile", f"{t2s_output_dir}/t2s_fsdec.onnx",
-                "--optimizeLevel", "2",
+                "--optimizeLevel", "1",
                 "--optimizePrefer", "2",
                 "--MNNModel", f"{t2s_output_dir}/t2s_fsdec.mnn",
                 "--weightQuantBits", "8",
@@ -182,9 +180,7 @@ def export_complete_v1v2_pipeline(
             logger.info(f"Error exporting to MNN: {e}")
             logger.info(f"stdout: {e.stdout}")
             logger.info(f"stderr: {e.stderr}")
-        sdec = onnx.load(f"{t2s_output_dir}/t2s_sdec.onnx")
-        sdec_fp16 = convert_float_to_float16(sdec, keep_io_types=False)
-        quantize_dynamic(sdec_fp16, f"{t2s_output_dir}/t2s_sdec.onnx", weight_type=QuantType.QInt8, op_types_to_quantize=['MatMul', 'Attention', 'Conv', 'Gemm'])
+        t2s_sdec_fp16_dynamic_quant(f"{t2s_output_dir}/t2s_sdec.onnx", f"{t2s_output_dir}/t2s_sdec.onnx")
         os.remove(f"{t2s_output_dir}/t2s_fsdec.onnx")
 
         logger.info("=> Export pipeline completed without quantization")
