@@ -128,7 +128,7 @@ class GSVRuntime:
             present_kv = [kv.astype(np.float16) for kv in present_kv]
 
         # T2S sdec
-        sdec_input_names = ['iy', 'iy_emb'] + [f'past_k_layer_{i}' for i in range(24)] + [f'past_v_layer_{i}' for i in range(24)]
+        sdec_input_names = ['iy', 'iy_emb', 'temperature', 'top_k', 'repeat_penalty'] + [f'past_k_layer_{i}' for i in range(24)] + [f'past_v_layer_{i}' for i in range(24)]
         sdec_output_names = []
         if self.config["quantized"]:
             sdec_output_names = ['y', 'stop_condition_tensor', 'increased_y_emb'] + \
@@ -139,10 +139,13 @@ class GSVRuntime:
                                 [f'increased_k_layer_{i}' for i in range(24)] + \
                                 [f'increased_v_layer_{i}' for i in range(24)]
 
+        temperature = np.array([1.0]).astype(np.float16 if not self.config["quantized"] else np.float32)
+        top_k = np.array([15]).astype(np.int64)
+        repeat_penalty = np.array([1.35]).astype(np.float16 if not self.config["quantized"] else np.float32)
         idx: int = 0
         for idx in tqdm(range(1000), desc="T2S SDec Inference"):
             sdec_input = {}
-            for name, tensor in zip(sdec_input_names, [y, y_emb] + present_kv):
+            for name, tensor in zip(sdec_input_names, [y, y_emb, temperature, top_k, repeat_penalty] + present_kv):
                 sdec_input[name] = tensor
             y, stop_condition_tensor, y_emb_new, *new_key_values = self.t2s_sdec.run(sdec_output_names, sdec_input)
             y_emb = np.concatenate([y_emb, y_emb_new], axis=1)
@@ -169,7 +172,7 @@ class GSVRuntime:
 
 
 if __name__ == "__main__":
-    rt = GSVRuntime('/home/eleven/GPT-SoVITS-export/onnx/seia_v2pp.gsv')
+    rt = GSVRuntime('/home/eleven/GPT-SoVITS-export/onnx/ba_v2.gsv')
     audio = rt.infer("やがて来る世界を見渡せば、必ず赤い旗の世界となるだろう。")
     audio_postprocess([audio], 'onnx/output.wav')
 

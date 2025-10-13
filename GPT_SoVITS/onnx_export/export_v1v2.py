@@ -22,6 +22,7 @@ from export_sovits_v1v2 import export_sovits_v1v2_to_onnx
 from genie_t2s_converter.Converter import convert_t2s_only
 from t2s_quantization import quantize_t2s, t2s_sdec_fp16_dynamic_quant
 from preprocess_utils import preprocess_text, audio_preprocess
+from quantization_utils import find_node_by_op_name
 
 # Configure logging
 logging.basicConfig(
@@ -354,6 +355,7 @@ def create_reference_files(config: ExportConfig, tmp_dir: str) -> None:
     np.save(os.path.join(ref_dir, "ref_text_bert.npy"), ref_text_bert)
 
     logger.info("Reference files created successfully")
+
 
 def export_complete_v1v2_pipeline(config: ExportConfig) -> None:
     """

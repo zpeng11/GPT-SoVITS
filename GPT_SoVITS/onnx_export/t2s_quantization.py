@@ -222,6 +222,69 @@ class SDEC_Calib(CalibrationDataReader):
         
         return self.input_feed
 
+def plugin_sampling_parameters(t2s_sdec_path: str, is_quantized: bool):
+    """
+    Plugin sampling parameters into the T2S stage decoder model
+
+    Args:
+        t2s_sdec_path: Path to the T2S stage decoder ONNX model
+    """
+    model = onnx.load(t2s_sdec_path)
+
+    # Define new inputs for temperature, top_k, and top_p
+    temperature_input = onnx.helper.make_tensor_value_info('temperature', onnx.TensorProto.FLOAT if is_quantized else onnx.TensorProto.FLOAT16, [1])
+    top_k_input = onnx.helper.make_tensor_value_info('top_k', onnx.TensorProto.INT64, [1])
+    repeat_penalty_input = onnx.helper.make_tensor_value_info('repeat_penalty', onnx.TensorProto.FLOAT if is_quantized else onnx.TensorProto.FLOAT16, [1])
+
+    inputs = list(model.graph.input)
+    inputs = inputs[:2] + [temperature_input, top_k_input, repeat_penalty_input] + inputs[2:]
+    del model.graph.input[:]
+    model.graph.input.extend(inputs)
+
+    div_node = find_node_by_op_name(model, 'Div', '/Div')
+    div_node.input[1] = 'repeat_penalty'
+
+    mul_node = find_node_by_op_name(model, 'Mul', '/Mul')
+    mul_node.input[1] = 'repeat_penalty'
+
+    topk_node = find_node_by_op_name(model, 'TopK', '/TopK')
+    topk_node.input[1] = 'top_k'
+
+    where_node = find_node_by_op_name(model, 'Where', '/Where_1')
+    connection_output = where_node.output[0]
+    where_node.output[0] = 'temperature_input'
+
+    temperature_input_vi = onnx.helper.make_tensor_value_info('temperature_input', onnx.TensorProto.FLOAT if is_quantized else onnx.TensorProto.FLOAT16, [1025])
+
+    temperature_div = onnx.helper.make_node(
+        'Div',
+        inputs=['temperature_input', 'temperature'],
+        outputs=[connection_output],
+        name='/Temperature/Div'
+    )
+
+    model.graph.value_info.extend([temperature_input_vi])
+
+    # Find insertion point and add div node
+    insertion_index = 0
+    for i, node in enumerate(model.graph.node):
+        if node.name == '/Softmax':
+            insertion_index = i
+            break
+    model.graph.node.insert(insertion_index, temperature_div)
+
+    initializers_to_keep = []
+    for init in model.graph.initializer:
+        if init.name not in ['/Reshape_output_0', '/Constant_13_output_0']:
+            initializers_to_keep.append(init)
+
+    # Clear and rebuild initializer list
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(initializers_to_keep)
+
+    onnx.checker.check_model(model)
+    onnx.save(model, t2s_sdec_path)
+
 def quantize_t2s(fsdec_path: str, fsdec_quant_path: str,
                 sdec_path: str, sdec_quant_path: str,
                 ref_text: str, ref_audio_path: str) -> None:
@@ -254,6 +317,8 @@ def quantize_t2s(fsdec_path: str, fsdec_quant_path: str,
     sdec_exclude_nodes = get_nodes_to_exclude(sdec_path)
     fsdec_calib.rewind()
     quantize_model_static(sdec_path, sdec_quant_path, sdec_calib, sdec_exclude_nodes)
+
+    plugin_sampling_parameters(sdec_quant_path, is_quantized=True)
 
     # Configure model outputs for cross-model quantization
     k_quantizers, v_quantizers = _configure_quantizer_outputs(
@@ -539,6 +604,8 @@ def t2s_sdec_fp16_dynamic_quant(input_model_path: str, output_model_path: str) -
         per_channel=True,
         reduce_range=True
     )
+
+    plugin_sampling_parameters(output_model_path, is_quantized=False)
 
     logger.info(f"FP16 dynamic quantization completed: {output_model_path}")
 
