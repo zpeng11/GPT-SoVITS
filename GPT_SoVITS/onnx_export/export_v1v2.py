@@ -322,6 +322,8 @@ def create_configuration_file(config: ExportConfig, tmp_dir: str) -> None:
         "t2s_weights_path": config.t2s_ckpt_path,
         "vits_weights_path": config.sovits_path,
         "quantized": config.quantize,
+        "audio_file_name": os.path.basename(config.ref_voice),
+        "ref_text": config.ref_text
     }
 
     config_path = os.path.join(tmp_dir, "config.json")
